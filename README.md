@@ -74,3 +74,16 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
 ```
 
 The runtime currently returns deterministic placeholder matches. The shape is the important part: host applications should depend on this match-result contract, not training internals.
+
+Run feature-manifest-driven matching:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
+  --model-manifest /Volumes/FrameFusion/AetherFlow_VideoMatcherData/models/aetherflow-video-match-baseline/v0001/model_manifest.json \
+  --reference /path/to/reference.mp4 \
+  --source /path/to/source.mp4 \
+  --reference-feature-manifest /path/to/reference.visual-features.json \
+  --source-feature-manifest /path/to/source.visual-features.json
+```
+
+When feature manifests are provided, the runtime computes a lightweight color-stat distance and emits `feature_manifest_match` reconstruction metadata. Without feature manifests, it falls back to deterministic placeholder output.

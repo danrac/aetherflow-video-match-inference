@@ -18,6 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model-manifest", required=True)
     run.add_argument("--reference", required=True)
     run.add_argument("--source", action="append", required=True)
+    run.add_argument("--reference-feature-manifest")
+    run.add_argument("--source-feature-manifest", action="append", default=[])
     run.add_argument("--output")
 
     return parser
@@ -31,6 +33,8 @@ def main(argv: list[str] | None = None) -> int:
                 reference_path=args.reference,
                 source_paths=tuple(args.source),
                 model_manifest_path=args.model_manifest,
+                reference_feature_manifest_path=args.reference_feature_manifest,
+                source_feature_manifest_paths=tuple(args.source_feature_manifest),
             )
         )
         output_path = inference_output_path(args.output)
