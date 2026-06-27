@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile
+        run: python -m compileall -q src
+      - name: Create model fixture
+        run: |
+          mkdir -p /tmp/aetherflow-inference-fixture
+          cat > /tmp/aetherflow-inference-fixture/model_manifest.json <<'JSON'
+          {
+            "schema_version": "0.1.0",
+            "model_id": "ci-baseline",
+            "model_version": "v0001",
+            "created_at": "2026-06-27T00:00:00+00:00",
+            "onnx_path": "model.onnx",
+            "trained_on_dataset": {
+              "dataset_id": "ci-training-fixture",
+              "dataset_version": "v0001"
+            },
+            "metrics": {}
+          }
+          JSON
+      - name: Run placeholder inference
+        run: |
+          PYTHONPATH=src python -m aetherflow_video_match_inference.cli match \
+            --model-manifest /tmp/aetherflow-inference-fixture/model_manifest.json \
+            --reference /tmp/reference.mp4 \
+            --source /tmp/source-a.mp4 \
+            --output /tmp/aetherflow-inference-fixture/match_result.json
+      - name: Check result
+        run: test -f /tmp/aetherflow-inference-fixture/match_result.json
