@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .adapters import to_host_payload
 from .engine import MatchRequest, match
+from .interchange import export_edit_json, export_edl
 from .storage import inference_output_path
 
 
@@ -27,6 +28,15 @@ def build_parser() -> argparse.ArgumentParser:
     host.add_argument("--match-result", required=True)
     host.add_argument("--host", required=True)
     host.add_argument("--output", required=True)
+
+    edit_json = subcommands.add_parser("export-edit-json")
+    edit_json.add_argument("--host-payload", required=True)
+    edit_json.add_argument("--output", required=True)
+
+    edl = subcommands.add_parser("export-edl")
+    edl.add_argument("--host-payload", required=True)
+    edl.add_argument("--output", required=True)
+    edl.add_argument("--title", default="AETHERFLOW_VIDEO_MATCH")
 
     return parser
 
@@ -55,6 +65,16 @@ def main(argv: list[str] | None = None) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(to_host_payload(match_result, args.host), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(output_path)
+        return 0
+    if args.command == "export-edit-json":
+        with Path(args.host_payload).open("r", encoding="utf-8") as handle:
+            host_payload = json.load(handle)
+        print(export_edit_json(host_payload, args.output))
+        return 0
+    if args.command == "export-edl":
+        with Path(args.host_payload).open("r", encoding="utf-8") as handle:
+            host_payload = json.load(handle)
+        print(export_edl(host_payload, args.output, args.title))
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")
 

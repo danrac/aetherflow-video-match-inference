@@ -98,3 +98,17 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli host-payload \
 ```
 
 The host payload includes the raw match result plus an ordered edit list with frame and second offsets.
+
+Export generic interchange files from a host payload:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-edit-json \
+  --host-payload /path/to/host_payload.json \
+  --output /path/to/edits.json
+```
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-edl \
+  --host-payload /path/to/host_payload.json \
+  --output /path/to/timeline.edl
+```

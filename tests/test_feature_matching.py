@@ -9,6 +9,7 @@ from pathlib import Path
 
 from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.engine import MatchRequest, match
+from aetherflow_video_match_inference.interchange import export_edit_json, export_edl, frames_to_timecode
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
 
@@ -88,6 +89,29 @@ class FeatureMatchingTests(unittest.TestCase):
             errors = validate_schema_subset(payload, schema)
 
             self.assertEqual(errors, [])
+
+    def test_interchange_exports_from_host_payload(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-interchange-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            result = match(
+                MatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    source_paths=("/tmp/source.mp4",),
+                    model_manifest_path=str(model_manifest),
+                )
+            )
+            payload = to_host_payload(result, "aetherflow")
+
+            json_path = export_edit_json(payload, root / "edits.json")
+            edl_path = export_edl(payload, root / "timeline.edl")
+
+            self.assertTrue(json_path.exists())
+            self.assertIn("TITLE: AETHERFLOW_VIDEO_MATCH", edl_path.read_text(encoding="utf-8"))
+            self.assertIn("00:00:05:00", edl_path.read_text(encoding="utf-8"))
+
+    def test_frames_to_timecode_uses_rounded_fps(self) -> None:
+        self.assertEqual(frames_to_timecode(120, 24.0), "00:00:05:00")
 
 
 def write_model_manifest(root: Path) -> Path:
