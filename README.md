@@ -112,3 +112,11 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-edl \
   --host-payload /path/to/host_payload.json \
   --output /path/to/timeline.edl
 ```
+
+Export an After Effects ExtendScript importer:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-ae-extendscript \
+  --host-payload /path/to/host_payload.json \
+  --output /path/to/aetherflow_import.jsx
+```

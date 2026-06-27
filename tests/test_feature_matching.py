@@ -9,7 +9,7 @@ from pathlib import Path
 
 from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.engine import MatchRequest, match
-from aetherflow_video_match_inference.interchange import export_edit_json, export_edl, frames_to_timecode
+from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_edit_json, export_edl, frames_to_timecode
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
 
@@ -105,10 +105,15 @@ class FeatureMatchingTests(unittest.TestCase):
 
             json_path = export_edit_json(payload, root / "edits.json")
             edl_path = export_edl(payload, root / "timeline.edl")
+            jsx_path = export_after_effects_extendscript(payload, root / "aetherflow_import.jsx")
 
             self.assertTrue(json_path.exists())
             self.assertIn("TITLE: AETHERFLOW_VIDEO_MATCH", edl_path.read_text(encoding="utf-8"))
             self.assertIn("00:00:05:00", edl_path.read_text(encoding="utf-8"))
+            jsx = jsx_path.read_text(encoding="utf-8")
+            self.assertIn("app.beginUndoGroup", jsx)
+            self.assertIn("project.items.addComp", jsx)
+            self.assertIn("comp.layers.add", jsx)
 
     def test_frames_to_timecode_uses_rounded_fps(self) -> None:
         self.assertEqual(frames_to_timecode(120, 24.0), "00:00:05:00")

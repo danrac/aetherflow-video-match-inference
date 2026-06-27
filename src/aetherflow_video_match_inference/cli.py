@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .adapters import to_host_payload
 from .engine import MatchRequest, match
-from .interchange import export_edit_json, export_edl
+from .interchange import export_after_effects_extendscript, export_edit_json, export_edl
 from .storage import inference_output_path
 
 
@@ -37,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     edl.add_argument("--host-payload", required=True)
     edl.add_argument("--output", required=True)
     edl.add_argument("--title", default="AETHERFLOW_VIDEO_MATCH")
+
+    ae = subcommands.add_parser("export-ae-extendscript")
+    ae.add_argument("--host-payload", required=True)
+    ae.add_argument("--output", required=True)
+    ae.add_argument("--comp-name", default="AetherFlow Video Match")
 
     return parser
 
@@ -75,6 +80,11 @@ def main(argv: list[str] | None = None) -> int:
         with Path(args.host_payload).open("r", encoding="utf-8") as handle:
             host_payload = json.load(handle)
         print(export_edl(host_payload, args.output, args.title))
+        return 0
+    if args.command == "export-ae-extendscript":
+        with Path(args.host_payload).open("r", encoding="utf-8") as handle:
+            host_payload = json.load(handle)
+        print(export_after_effects_extendscript(host_payload, args.output, args.comp_name))
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")
 
