@@ -9,6 +9,7 @@ from pathlib import Path
 
 from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.engine import MatchRequest, match
+from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, frames_to_timecode
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
@@ -50,6 +51,43 @@ class FeatureMatchingTests(unittest.TestCase):
             )
 
             self.assertEqual(result["matches"][0]["reconstruction"]["operation"], "placeholder_match")
+
+    def test_v3_feature_distance_uses_scene_and_flow_stats(self) -> None:
+        reference = {
+            "features": [
+                {
+                    "mean_rgb": [100.0, 120.0, 140.0],
+                    "mean_luma": 118.0,
+                    "edge_density": 0.10,
+                    "scene_change_score": 2.0,
+                    "mean_absdiff_from_previous": 2.0,
+                    "optical_flow": {"mean_magnitude": 0.25, "mean_dx": 0.10, "mean_dy": 0.02},
+                }
+            ]
+        }
+        source_without_v3_delta = {
+            "features": [
+                {
+                    "mean_rgb": [100.0, 120.0, 140.0],
+                    "mean_absdiff_from_previous": 2.0,
+                }
+            ]
+        }
+        source_with_v3_delta = {
+            "features": [
+                {
+                    "mean_rgb": [100.0, 120.0, 140.0],
+                    "mean_luma": 130.0,
+                    "edge_density": 0.40,
+                    "scene_change_score": 7.0,
+                    "mean_absdiff_from_previous": 2.0,
+                    "optical_flow": {"mean_magnitude": 1.25, "mean_dx": 0.50, "mean_dy": -0.20},
+                }
+            ]
+        }
+
+        self.assertEqual(visual_distance(reference, source_without_v3_delta), 0.0)
+        self.assertGreater(visual_distance(reference, source_with_v3_delta), 20.0)
 
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:

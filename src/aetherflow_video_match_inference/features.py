@@ -26,11 +26,15 @@ def visual_distance(reference_features: dict[str, Any], source_features: dict[st
     if reference_vector is None or source_vector is None:
         return None
     color_component = sqrt(sum((reference_vector[index] - source_vector[index]) ** 2 for index in range(3)))
-    reference_motion = average_motion(reference_features)
-    source_motion = average_motion(source_features)
-    if reference_motion is None or source_motion is None:
-        return color_component
-    return color_component + abs(reference_motion - source_motion)
+    return round(
+        color_component
+        + scalar_delta(reference_features, source_features, "mean_absdiff_from_previous", weight=1.0)
+        + scalar_delta(reference_features, source_features, "mean_luma", weight=0.25)
+        + scalar_delta(reference_features, source_features, "edge_density", weight=50.0)
+        + scalar_delta(reference_features, source_features, "scene_change_score", weight=1.0)
+        + optical_flow_delta(reference_features, source_features),
+        6,
+    )
 
 
 def average_mean_rgb(feature_document: dict[str, Any]) -> tuple[float, float, float] | None:
@@ -42,12 +46,55 @@ def average_mean_rgb(feature_document: dict[str, Any]) -> tuple[float, float, fl
 
 
 def average_motion(feature_document: dict[str, Any]) -> float | None:
+    return average_scalar(feature_document, "mean_absdiff_from_previous")
+
+
+def average_scalar(feature_document: dict[str, Any], field: str) -> float | None:
     frames = feature_document.get("features", [])
     values = [
-        float(frame["mean_absdiff_from_previous"])
+        float(frame[field])
         for frame in frames
-        if isinstance(frame, dict) and frame.get("mean_absdiff_from_previous") is not None
+        if isinstance(frame, dict) and frame.get(field) is not None
     ]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def scalar_delta(reference_features: dict[str, Any], source_features: dict[str, Any], field: str, weight: float) -> float:
+    reference_value = average_scalar(reference_features, field)
+    source_value = average_scalar(source_features, field)
+    if reference_value is None or source_value is None:
+        return 0.0
+    return abs(reference_value - source_value) * weight
+
+
+def optical_flow_delta(reference_features: dict[str, Any], source_features: dict[str, Any]) -> float:
+    return (
+        scalar_delta_from_flow(reference_features, source_features, "mean_magnitude", weight=5.0)
+        + scalar_delta_from_flow(reference_features, source_features, "mean_dx", weight=2.0)
+        + scalar_delta_from_flow(reference_features, source_features, "mean_dy", weight=2.0)
+    )
+
+
+def scalar_delta_from_flow(reference_features: dict[str, Any], source_features: dict[str, Any], field: str, weight: float) -> float:
+    reference_value = average_optical_flow_scalar(reference_features, field)
+    source_value = average_optical_flow_scalar(source_features, field)
+    if reference_value is None or source_value is None:
+        return 0.0
+    return abs(reference_value - source_value) * weight
+
+
+def average_optical_flow_scalar(feature_document: dict[str, Any], field: str) -> float | None:
+    frames = feature_document.get("features", [])
+    values = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        flow = frame.get("optical_flow")
+        if not isinstance(flow, dict) or flow.get(field) is None:
+            continue
+        values.append(float(flow[field]))
     if not values:
         return None
     return sum(values) / len(values)

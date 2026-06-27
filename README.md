@@ -86,7 +86,7 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
   --source-feature-manifest /path/to/source.visual-features.json
 ```
 
-When feature manifests are provided, the runtime computes a lightweight visual distance from color and optional motion statistics, then emits `feature_manifest_match` reconstruction metadata. Without feature manifests, it falls back to deterministic placeholder output.
+When feature manifests are provided, the runtime computes a lightweight visual distance from color and optional motion statistics, then emits `feature_manifest_match` reconstruction metadata. `opencv-visual-stats-v3` manifests also contribute luma, edge-density, scene-change, and sparse optical-flow statistics. Without feature manifests, it falls back to deterministic placeholder output.
 
 Create a host-facing payload with timeline edit reconstruction:
 
