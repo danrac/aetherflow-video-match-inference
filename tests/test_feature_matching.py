@@ -10,6 +10,8 @@ from pathlib import Path
 from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.engine import MatchRequest, match
 
+CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
+
 
 class FeatureMatchingTests(unittest.TestCase):
     def test_feature_manifest_match_uses_feature_confidence(self) -> None:
@@ -61,10 +63,31 @@ class FeatureMatchingTests(unittest.TestCase):
 
             payload = to_host_payload(result, "aetherflow")
 
+            self.assertEqual(payload["schema_version"], "0.1.0")
             self.assertEqual(payload["host"], "aetherflow")
             self.assertEqual(payload["timeline"]["edit_count"], 1)
             self.assertEqual(payload["timeline"]["edits"][0]["reference_in_seconds"], 0.0)
             self.assertEqual(payload["timeline"]["edits"][0]["reference_out_seconds"], 5.0)
+
+    def test_host_payload_matches_contract_schema(self) -> None:
+        schema_path = CONTRACTS_ROOT / "schemas" / "host_payload.schema.json"
+        if not schema_path.exists():
+            self.skipTest("contracts checkout is not available")
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-schema-") as temp_dir:
+            model_manifest = write_model_manifest(Path(temp_dir))
+            result = match(
+                MatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    source_paths=("/tmp/source.mp4",),
+                    model_manifest_path=str(model_manifest),
+                )
+            )
+            payload = to_host_payload(result, "aetherflow")
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+            errors = validate_schema_subset(payload, schema)
+
+            self.assertEqual(errors, [])
 
 
 def write_model_manifest(root: Path) -> Path:
@@ -109,6 +132,55 @@ def write_feature_manifest(path: Path, clip_id: str, mean_rgb: list[float], moti
 
 def write_json(path: Path, document: dict) -> None:
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def validate_schema_subset(document, schema: dict, path: str = "$") -> list[str]:
+    errors: list[str] = []
+    expected_type = schema.get("type")
+    if expected_type and not matches_type(document, expected_type):
+        return [f"{path}: expected {expected_type}"]
+
+    if expected_type == "object":
+        for key in schema.get("required", []):
+            if key not in document:
+                errors.append(f"{path}: missing required property {key}")
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            for key in document:
+                if key not in properties:
+                    errors.append(f"{path}: additional property {key}")
+        for key, value in document.items():
+            if key in properties:
+                errors.extend(validate_schema_subset(value, properties[key], f"{path}.{key}"))
+
+    if expected_type == "array":
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(document):
+                errors.extend(validate_schema_subset(item, item_schema, f"{path}[{index}]"))
+
+    if isinstance(document, (int, float)) and not isinstance(document, bool):
+        if schema.get("minimum") is not None and document < schema["minimum"]:
+            errors.append(f"{path}: expected >= {schema['minimum']}")
+        if schema.get("maximum") is not None and document > schema["maximum"]:
+            errors.append(f"{path}: expected <= {schema['maximum']}")
+        if schema.get("exclusiveMinimum") is not None and document <= schema["exclusiveMinimum"]:
+            errors.append(f"{path}: expected > {schema['exclusiveMinimum']}")
+    return errors
+
+
+def matches_type(value, expected_type: str) -> bool:
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return True
 
 
 if __name__ == "__main__":
