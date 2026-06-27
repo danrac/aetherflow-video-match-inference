@@ -1,0 +1,7 @@
+{
+  "model_manifest": "models/video-match-model-v0001/model_manifest.json",
+  "runtime": {
+    "provider": "onnxruntime",
+    "preferred_execution_provider": "CUDAExecutionProvider"
+  }
+}
