@@ -12,6 +12,9 @@ onnx = [
   "onnxruntime>=1.18",
 ]
 
+[project.scripts]
+aetherflow-video-match-inference = "aetherflow_video_match_inference.cli:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

@@ -39,3 +39,17 @@ match(reference_path, source_paths, model_manifest_path) -> MatchResult
 ```
 
 Host integrations should adapt this result to AetherFlow, Premiere Pro, or After Effects rather than changing the core inference output.
+
+## Smoke Command
+
+Run placeholder inference from a model manifest:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
+  --model-manifest /private/tmp/aetherflow-video-match-smoke/model/model_manifest.json \
+  --reference /private/tmp/aetherflow-video-match-smoke/dataset/references/sample-0001.reference.txt \
+  --source /private/tmp/aetherflow-video-match-smoke/dataset/clips/clip-0001.txt \
+  --output /private/tmp/aetherflow-video-match-smoke/match_result.json
+```
+
+The runtime currently returns deterministic placeholder matches. The shape is the important part: host applications should depend on this match-result contract, not training internals.
