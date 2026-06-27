@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from .engine import MatchRequest, match
+from .storage import inference_output_path
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -17,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--model-manifest", required=True)
     run.add_argument("--reference", required=True)
     run.add_argument("--source", action="append", required=True)
-    run.add_argument("--output", required=True)
+    run.add_argument("--output")
 
     return parser
 
@@ -32,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
                 model_manifest_path=args.model_manifest,
             )
         )
-        output_path = Path(args.output)
+        output_path = inference_output_path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(output_path)

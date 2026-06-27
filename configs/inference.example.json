@@ -1,5 +1,7 @@
 {
   "model_manifest": "models/video-match-model-v0001/model_manifest.json",
+  "data_root_env": "AETHERFLOW_VIDEO_MATCH_DATA_ROOT",
+  "default_output_dir": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/inference",
   "runtime": {
     "provider": "onnxruntime",
     "preferred_execution_provider": "CUDAExecutionProvider"

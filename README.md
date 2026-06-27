@@ -40,16 +40,37 @@ match(reference_path, source_paths, model_manifest_path) -> MatchResult
 
 Host integrations should adapt this result to AetherFlow, Premiere Pro, or After Effects rather than changing the core inference output.
 
+## Storage Root
+
+Generated inference results should live on the FrameFusion volume.
+
+Default root:
+
+```text
+/Volumes/FrameFusion/AetherFlow_VideoMatcherData
+```
+
+Override when needed:
+
+```bash
+export AETHERFLOW_VIDEO_MATCH_DATA_ROOT=/Volumes/FrameFusion/AetherFlow_VideoMatcherData
+```
+
+When `--output` is omitted, match results are written to:
+
+```text
+$AETHERFLOW_VIDEO_MATCH_DATA_ROOT/inference/match_result_<timestamp>.json
+```
+
 ## Smoke Command
 
 Run placeholder inference from a model manifest:
 
 ```bash
 PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
-  --model-manifest /private/tmp/aetherflow-video-match-smoke/model/model_manifest.json \
-  --reference /private/tmp/aetherflow-video-match-smoke/dataset/references/sample-0001.reference.txt \
-  --source /private/tmp/aetherflow-video-match-smoke/dataset/clips/clip-0001.txt \
-  --output /private/tmp/aetherflow-video-match-smoke/match_result.json
+  --model-manifest /Volumes/FrameFusion/AetherFlow_VideoMatcherData/models/aetherflow-video-match-baseline/v0001/model_manifest.json \
+  --reference /Volumes/FrameFusion/AetherFlow_VideoMatcherData/datasets/framefusion-smoke-video/v0001/references/sample-video-0001.reference.mp4 \
+  --source /Volumes/FrameFusion/AetherFlow_VideoMatcherData/datasets/framefusion-smoke-video/v0001/clips/clip-video-0001.mp4
 ```
 
 The runtime currently returns deterministic placeholder matches. The shape is the important part: host applications should depend on this match-result contract, not training internals.
