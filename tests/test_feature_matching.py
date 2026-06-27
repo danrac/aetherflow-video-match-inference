@@ -154,12 +154,18 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(cep_json["timeline"]["layers"][0]["layer_id"], "edit-0001")
             self.assertEqual(cep_json["timeline"]["layers"][0]["start_seconds"], 0.0)
             self.assertIn("place_layers_by_seconds", cep_json["instructions"])
+            cep_schema_path = CONTRACTS_ROOT / "schemas" / "cep_handoff.schema.json"
+            if cep_schema_path.exists():
+                self.assertEqual(validate_schema_subset(cep_json, json.loads(cep_schema_path.read_text(encoding="utf-8"))), [])
             premiere_json = json.loads(premiere_path.read_text(encoding="utf-8"))
             self.assertEqual(premiere_json["adapter"], "premiere-pro-json")
             self.assertEqual(premiere_json["host"], "premiere-pro")
             self.assertEqual(premiere_json["clips"][0]["clip_id"], "edit-0001")
             self.assertEqual(premiere_json["clips"][0]["target_video_track"], 0)
             self.assertIn("insert_clips_by_frames", premiere_json["instructions"])
+            premiere_schema_path = CONTRACTS_ROOT / "schemas" / "premiere_handoff.schema.json"
+            if premiere_schema_path.exists():
+                self.assertEqual(validate_schema_subset(premiere_json, json.loads(premiere_schema_path.read_text(encoding="utf-8"))), [])
             self.assertIn("TITLE: AETHERFLOW_VIDEO_MATCH", edl_path.read_text(encoding="utf-8"))
             self.assertIn("00:00:05:00", edl_path.read_text(encoding="utf-8"))
             jsx = jsx_path.read_text(encoding="utf-8")
