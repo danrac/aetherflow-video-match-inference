@@ -9,6 +9,7 @@ from pathlib import Path
 from .adapters import to_host_payload
 from .engine import MatchRequest, match
 from .interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json
+from .onnx_runtime import validate_onnx_model
 from .storage import inference_output_path
 
 
@@ -23,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--reference-feature-manifest")
     run.add_argument("--source-feature-manifest", action="append", default=[])
     run.add_argument("--output")
+
+    validate_model = subcommands.add_parser("validate-model")
+    validate_model.add_argument("--model-manifest", required=True)
 
     host = subcommands.add_parser("host-payload")
     host.add_argument("--match-result", required=True)
@@ -72,6 +76,11 @@ def main(argv: list[str] | None = None) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(output_path)
+        return 0
+    if args.command == "validate-model":
+        with Path(args.model_manifest).open("r", encoding="utf-8") as handle:
+            model_manifest = json.load(handle)
+        print(json.dumps(validate_onnx_model(args.model_manifest, model_manifest), indent=2, sort_keys=True))
         return 0
     if args.command == "host-payload":
         with Path(args.match_result).open("r", encoding="utf-8") as handle:

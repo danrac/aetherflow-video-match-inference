@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.engine import MatchRequest, match
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
+from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
 
@@ -51,6 +53,19 @@ class FeatureMatchingTests(unittest.TestCase):
             )
 
             self.assertEqual(result["matches"][0]["reconstruction"]["operation"], "placeholder_match")
+
+    def test_validate_onnx_model_when_onnxruntime_is_available(self) -> None:
+        if importlib.util.find_spec("onnxruntime") is None:
+            self.skipTest("onnxruntime is not available in this Python runtime")
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-onnx-") as temp_dir:
+            root = Path(temp_dir)
+            (root / "model.onnx").write_bytes(identity_onnx_model_bytes())
+            model_manifest = write_model_manifest(root)
+
+            report = validate_onnx_model(model_manifest, json.loads(model_manifest.read_text(encoding="utf-8")))
+
+            self.assertEqual(report["inputs"][0]["name"], "features")
+            self.assertEqual(report["outputs"][0]["name"], "scores")
 
     def test_v3_feature_distance_uses_scene_and_flow_stats(self) -> None:
         reference = {
@@ -187,6 +202,11 @@ def write_model_manifest(root: Path) -> Path:
             "model_version": "v0001",
             "created_at": "2026-06-27T00:00:00+00:00",
             "onnx_path": "model.onnx",
+            "model_architecture": {
+                "type": "identity_baseline",
+                "input_name": "features",
+                "output_name": "scores",
+            },
             "trained_on_dataset": {"dataset_id": "test", "dataset_version": "v0001"},
             "metrics": {},
         },
@@ -219,6 +239,53 @@ def write_feature_manifest(path: Path, clip_id: str, mean_rgb: list[float], moti
 
 def write_json(path: Path, document: dict) -> None:
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def identity_onnx_model_bytes() -> bytes:
+    def varint(value: int) -> bytes:
+        output = []
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                output.append(byte | 0x80)
+            else:
+                output.append(byte)
+                break
+        return bytes(output)
+
+    def key(field_number: int, wire_type: int) -> bytes:
+        return varint((field_number << 3) | wire_type)
+
+    def int_field(field_number: int, value: int) -> bytes:
+        return key(field_number, 0) + varint(value)
+
+    def string_field(field_number: int, value: str) -> bytes:
+        encoded = value.encode("utf-8")
+        return key(field_number, 2) + varint(len(encoded)) + encoded
+
+    def message_field(field_number: int, value: bytes) -> bytes:
+        return key(field_number, 2) + varint(len(value)) + value
+
+    def dimension(value: int | None = None) -> bytes:
+        return b"" if value is None else int_field(1, value)
+
+    def tensor_shape() -> bytes:
+        return message_field(1, dimension(None)) + message_field(1, dimension(4))
+
+    def tensor_type() -> bytes:
+        return int_field(1, 1) + message_field(2, tensor_shape())
+
+    def type_proto() -> bytes:
+        return message_field(1, tensor_type())
+
+    def value_info(name: str) -> bytes:
+        return string_field(1, name) + message_field(2, type_proto())
+
+    node = string_field(1, "features") + string_field(2, "scores") + string_field(3, "identity_baseline") + string_field(4, "Identity")
+    graph = message_field(1, node) + string_field(2, "aetherflow_video_match_baseline") + message_field(11, value_info("features")) + message_field(12, value_info("scores"))
+    opset = string_field(1, "") + int_field(2, 13)
+    return int_field(1, 8) + string_field(2, "aetherflow-video-match-training") + message_field(7, graph) + message_field(8, opset)
 
 
 def validate_schema_subset(document, schema: dict, path: str = "$") -> list[str]:

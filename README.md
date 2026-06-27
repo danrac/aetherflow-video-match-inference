@@ -75,6 +75,13 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
 
 The runtime currently returns deterministic placeholder matches. The shape is the important part: host applications should depend on this match-result contract, not training internals.
 
+Validate that a model manifest points to an ONNX model loadable by ONNX Runtime:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli validate-model \
+  --model-manifest /Volumes/FrameFusion/AetherFlow_VideoMatcherData/models/aetherflow-video-match-baseline/v0001/model_manifest.json
+```
+
 Run feature-manifest-driven matching:
 
 ```bash
