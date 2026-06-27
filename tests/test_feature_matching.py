@@ -10,7 +10,7 @@ from pathlib import Path
 from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.engine import MatchRequest, match
 from aetherflow_video_match_inference.features import visual_distance
-from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, frames_to_timecode
+from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
 
@@ -143,6 +143,7 @@ class FeatureMatchingTests(unittest.TestCase):
 
             json_path = export_edit_json(payload, root / "edits.json")
             cep_path = export_cep_json(payload, root / "aetherflow_cep.json")
+            premiere_path = export_premiere_json(payload, root / "premiere.json")
             edl_path = export_edl(payload, root / "timeline.edl")
             jsx_path = export_after_effects_extendscript(payload, root / "aetherflow_import.jsx")
 
@@ -153,6 +154,12 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(cep_json["timeline"]["layers"][0]["layer_id"], "edit-0001")
             self.assertEqual(cep_json["timeline"]["layers"][0]["start_seconds"], 0.0)
             self.assertIn("place_layers_by_seconds", cep_json["instructions"])
+            premiere_json = json.loads(premiere_path.read_text(encoding="utf-8"))
+            self.assertEqual(premiere_json["adapter"], "premiere-pro-json")
+            self.assertEqual(premiere_json["host"], "premiere-pro")
+            self.assertEqual(premiere_json["clips"][0]["clip_id"], "edit-0001")
+            self.assertEqual(premiere_json["clips"][0]["target_video_track"], 0)
+            self.assertIn("insert_clips_by_frames", premiere_json["instructions"])
             self.assertIn("TITLE: AETHERFLOW_VIDEO_MATCH", edl_path.read_text(encoding="utf-8"))
             self.assertIn("00:00:05:00", edl_path.read_text(encoding="utf-8"))
             jsx = jsx_path.read_text(encoding="utf-8")

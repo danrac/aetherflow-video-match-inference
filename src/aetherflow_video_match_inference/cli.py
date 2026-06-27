@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .adapters import to_host_payload
 from .engine import MatchRequest, match
-from .interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl
+from .interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json
 from .storage import inference_output_path
 
 
@@ -37,6 +37,11 @@ def build_parser() -> argparse.ArgumentParser:
     cep_json.add_argument("--host-payload", required=True)
     cep_json.add_argument("--output", required=True)
     cep_json.add_argument("--workflow-id", default="aetherflow-video-match")
+
+    premiere_json = subcommands.add_parser("export-premiere-json")
+    premiere_json.add_argument("--host-payload", required=True)
+    premiere_json.add_argument("--output", required=True)
+    premiere_json.add_argument("--sequence-name", default="AetherFlow Video Match")
 
     edl = subcommands.add_parser("export-edl")
     edl.add_argument("--host-payload", required=True)
@@ -85,6 +90,11 @@ def main(argv: list[str] | None = None) -> int:
         with Path(args.host_payload).open("r", encoding="utf-8") as handle:
             host_payload = json.load(handle)
         print(export_cep_json(host_payload, args.output, args.workflow_id))
+        return 0
+    if args.command == "export-premiere-json":
+        with Path(args.host_payload).open("r", encoding="utf-8") as handle:
+            host_payload = json.load(handle)
+        print(export_premiere_json(host_payload, args.output, args.sequence_name))
         return 0
     if args.command == "export-edl":
         with Path(args.host_payload).open("r", encoding="utf-8") as handle:

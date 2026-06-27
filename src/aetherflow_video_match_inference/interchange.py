@@ -83,6 +83,58 @@ def cep_layer_from_edit(edit: dict) -> dict:
     }
 
 
+def export_premiere_json(host_payload: dict, output_path: str | Path, sequence_name: str = "AetherFlow Video Match") -> Path:
+    """Export a Premiere-oriented JSON handoff file."""
+
+    timeline = host_payload["timeline"]
+    document = {
+        "schema_version": host_payload.get("schema_version", "0.1.0"),
+        "adapter": "premiere-pro-json",
+        "adapter_version": "0.1.0",
+        "host": "premiere-pro",
+        "sequence": {
+            "name": sequence_name,
+            "fps": timeline.get("fps"),
+            "duration_frames": timeline.get("duration_frames"),
+            "duration_seconds": timeline.get("duration_seconds"),
+        },
+        "clips": [premiere_clip_from_edit(edit) for edit in timeline.get("edits", [])],
+        "instructions": [
+            "import_source_media",
+            "create_or_reuse_sequence",
+            "insert_clips_by_frames",
+            "apply_source_in_out",
+            "preserve_match_metadata_as_markers",
+        ],
+    }
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def premiere_clip_from_edit(edit: dict) -> dict:
+    return {
+        "clip_id": edit["edit_id"],
+        "source_path": edit["source_path"],
+        "target_video_track": int(edit.get("track", 0)),
+        "timeline_in_frames": edit["reference_in_frames"],
+        "timeline_out_frames": edit["reference_out_frames"],
+        "source_in_frames": edit["source_in_frames"],
+        "source_out_frames": edit["source_out_frames"],
+        "timeline_in_seconds": edit["reference_in_seconds"],
+        "timeline_out_seconds": edit["reference_out_seconds"],
+        "source_in_seconds": edit["source_in_seconds"],
+        "source_out_seconds": edit["source_out_seconds"],
+        "marker": {
+            "name": "AetherFlow Video Match",
+            "confidence": edit.get("confidence", 0.0),
+            "operation": edit.get("operation"),
+            "parameters": edit.get("parameters", {}),
+        },
+    }
+
+
 def export_edl(host_payload: dict, output_path: str | Path, title: str = "AETHERFLOW_VIDEO_MATCH") -> Path:
     timeline = host_payload["timeline"]
     fps = float(timeline.get("fps", 24.0) or 24.0)

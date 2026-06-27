@@ -115,6 +115,14 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-cep-json \
   --output /path/to/aetherflow_cep.json
 ```
 
+Export a Premiere Pro JSON handoff:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-premiere-json \
+  --host-payload /path/to/host_payload.json \
+  --output /path/to/premiere.json
+```
+
 ```bash
 PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-edl \
   --host-payload /path/to/host_payload.json \
