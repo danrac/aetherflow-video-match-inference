@@ -16,8 +16,8 @@ class FeatureMatchingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-features-") as temp_dir:
             root = Path(temp_dir)
             model_manifest = write_model_manifest(root)
-            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
-            source_features = write_feature_manifest(root / "source.features.json", "source", [101.0, 121.0, 141.0])
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0], motion=3.0)
+            source_features = write_feature_manifest(root / "source.features.json", "source", [101.0, 121.0, 141.0], motion=3.5)
 
             result = match(
                 MatchRequest(
@@ -31,6 +31,7 @@ class FeatureMatchingTests(unittest.TestCase):
 
             self.assertEqual(result["matches"][0]["reconstruction"]["operation"], "feature_manifest_match")
             self.assertGreater(result["matches"][0]["confidence"], 0.9)
+            self.assertGreater(result["matches"][0]["reconstruction"]["parameters"]["distance"], 1.7)
             self.assertEqual(result["reference"]["duration_frames"], 24)
 
     def test_match_falls_back_without_features(self) -> None:
@@ -83,23 +84,24 @@ def write_model_manifest(root: Path) -> Path:
     return path
 
 
-def write_feature_manifest(path: Path, clip_id: str, mean_rgb: list[float]) -> Path:
+def write_feature_manifest(path: Path, clip_id: str, mean_rgb: list[float], motion: float | None = None) -> Path:
+    frame = {
+        "frame_index": 0,
+        "mean_rgb": mean_rgb,
+        "std_rgb": [1.0, 1.0, 1.0],
+    }
+    if motion is not None:
+        frame["mean_absdiff_from_previous"] = motion
     write_json(
         path,
         {
             "clip_id": clip_id,
             "checksum": "abc123",
-            "feature_version": "opencv-color-stats-v1",
+            "feature_version": "opencv-visual-stats-v2",
             "duration_frames": 24,
             "fps": 24.0,
             "sampled_frame_count": 1,
-            "features": [
-                {
-                    "frame_index": 0,
-                    "mean_rgb": mean_rgb,
-                    "std_rgb": [1.0, 1.0, 1.0],
-                }
-            ],
+            "features": [frame],
         },
     )
     return path
