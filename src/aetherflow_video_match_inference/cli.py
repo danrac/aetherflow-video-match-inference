@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .adapters import to_host_payload
 from .engine import MatchRequest, match
 from .storage import inference_output_path
 
@@ -21,6 +22,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--reference-feature-manifest")
     run.add_argument("--source-feature-manifest", action="append", default=[])
     run.add_argument("--output")
+
+    host = subcommands.add_parser("host-payload")
+    host.add_argument("--match-result", required=True)
+    host.add_argument("--host", required=True)
+    host.add_argument("--output", required=True)
 
     return parser
 
@@ -40,6 +46,14 @@ def main(argv: list[str] | None = None) -> int:
         output_path = inference_output_path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(output_path)
+        return 0
+    if args.command == "host-payload":
+        with Path(args.match_result).open("r", encoding="utf-8") as handle:
+            match_result = json.load(handle)
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(to_host_payload(match_result, args.host), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(output_path)
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")

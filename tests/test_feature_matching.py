@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.engine import MatchRequest, match
 
 
@@ -45,6 +46,24 @@ class FeatureMatchingTests(unittest.TestCase):
             )
 
             self.assertEqual(result["matches"][0]["reconstruction"]["operation"], "placeholder_match")
+
+    def test_host_payload_includes_timeline_edits(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
+            model_manifest = write_model_manifest(Path(temp_dir))
+            result = match(
+                MatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    source_paths=("/tmp/source.mp4",),
+                    model_manifest_path=str(model_manifest),
+                )
+            )
+
+            payload = to_host_payload(result, "aetherflow")
+
+            self.assertEqual(payload["host"], "aetherflow")
+            self.assertEqual(payload["timeline"]["edit_count"], 1)
+            self.assertEqual(payload["timeline"]["edits"][0]["reference_in_seconds"], 0.0)
+            self.assertEqual(payload["timeline"]["edits"][0]["reference_out_seconds"], 5.0)
 
 
 def write_model_manifest(root: Path) -> Path:

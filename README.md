@@ -87,3 +87,14 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
 ```
 
 When feature manifests are provided, the runtime computes a lightweight color-stat distance and emits `feature_manifest_match` reconstruction metadata. Without feature manifests, it falls back to deterministic placeholder output.
+
+Create a host-facing payload with timeline edit reconstruction:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli host-payload \
+  --match-result /path/to/match_result.json \
+  --host aetherflow \
+  --output /path/to/host_payload.json
+```
+
+The host payload includes the raw match result plus an ordered edit list with frame and second offsets.
