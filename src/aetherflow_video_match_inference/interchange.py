@@ -21,6 +21,68 @@ def export_edit_json(host_payload: dict, output_path: str | Path) -> Path:
     return path
 
 
+def export_cep_json(host_payload: dict, output_path: str | Path, workflow_id: str = "aetherflow-video-match") -> Path:
+    """Export an AetherFlow CEP handoff JSON file.
+
+    The CEP adapter keeps host-facing instructions explicit so the panel can
+    import the file without understanding model internals.
+    """
+
+    timeline = host_payload["timeline"]
+    document = {
+        "schema_version": host_payload.get("schema_version", "0.1.0"),
+        "adapter": "aetherflow-cep-json",
+        "adapter_version": "0.1.0",
+        "workflow_id": workflow_id,
+        "host": "aetherflow-cep",
+        "source_host_payload_host": host_payload.get("host"),
+        "reference": {
+            "path": timeline.get("reference_path"),
+            "fps": timeline.get("fps"),
+            "duration_frames": timeline.get("duration_frames"),
+            "duration_seconds": timeline.get("duration_seconds"),
+        },
+        "timeline": {
+            "fps": timeline.get("fps"),
+            "duration_frames": timeline.get("duration_frames"),
+            "duration_seconds": timeline.get("duration_seconds"),
+            "edit_count": timeline.get("edit_count", 0),
+            "layers": [cep_layer_from_edit(edit) for edit in timeline.get("edits", [])],
+        },
+        "instructions": [
+            "import_source_media",
+            "create_or_reuse_composition",
+            "place_layers_by_seconds",
+            "apply_source_trim",
+            "preserve_confidence_metadata",
+        ],
+    }
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def cep_layer_from_edit(edit: dict) -> dict:
+    return {
+        "layer_id": edit["edit_id"],
+        "source_path": edit["source_path"],
+        "track": int(edit.get("track", 0)),
+        "start_seconds": edit["reference_in_seconds"] - edit["source_in_seconds"],
+        "in_point_seconds": edit["reference_in_seconds"],
+        "out_point_seconds": edit["reference_out_seconds"],
+        "source_in_seconds": edit["source_in_seconds"],
+        "source_out_seconds": edit["source_out_seconds"],
+        "reference_in_frames": edit["reference_in_frames"],
+        "reference_out_frames": edit["reference_out_frames"],
+        "source_in_frames": edit["source_in_frames"],
+        "source_out_frames": edit["source_out_frames"],
+        "confidence": edit.get("confidence", 0.0),
+        "operation": edit.get("operation"),
+        "parameters": edit.get("parameters", {}),
+    }
+
+
 def export_edl(host_payload: dict, output_path: str | Path, title: str = "AETHERFLOW_VIDEO_MATCH") -> Path:
     timeline = host_payload["timeline"]
     fps = float(timeline.get("fps", 24.0) or 24.0)

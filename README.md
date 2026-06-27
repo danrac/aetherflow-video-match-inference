@@ -107,6 +107,14 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-edit-json 
   --output /path/to/edits.json
 ```
 
+Export an AetherFlow CEP JSON handoff:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-cep-json \
+  --host-payload /path/to/host_payload.json \
+  --output /path/to/aetherflow_cep.json
+```
+
 ```bash
 PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-edl \
   --host-payload /path/to/host_payload.json \
