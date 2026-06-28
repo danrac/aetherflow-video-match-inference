@@ -28,6 +28,9 @@ def visual_distance(reference_features: dict[str, Any], source_features: dict[st
     color_component = sqrt(sum((reference_vector[index] - source_vector[index]) ** 2 for index in range(3)))
     return round(
         color_component
+        + grid_delta(reference_features, source_features, weight=0.35)
+        + histogram_delta(reference_features, source_features, "active_hue_histogram", weight=80.0)
+        + brightest_frame_delta(reference_features, source_features, weight=0.4)
         + scalar_delta(reference_features, source_features, "mean_absdiff_from_previous", weight=1.0)
         + scalar_delta(reference_features, source_features, "mean_luma", weight=0.25)
         + scalar_delta(reference_features, source_features, "edge_density", weight=50.0)
@@ -39,10 +42,76 @@ def visual_distance(reference_features: dict[str, Any], source_features: dict[st
 
 def average_mean_rgb(feature_document: dict[str, Any]) -> tuple[float, float, float] | None:
     frames = feature_document.get("features", [])
-    vectors = [frame.get("mean_rgb") for frame in frames if isinstance(frame, dict) and frame.get("mean_rgb")]
+    vectors = [
+        frame.get("active_mean_rgb") or frame.get("mean_rgb")
+        for frame in frames
+        if isinstance(frame, dict) and (frame.get("active_mean_rgb") or frame.get("mean_rgb"))
+    ]
     if not vectors:
         return None
     return tuple(sum(float(vector[index]) for vector in vectors) / len(vectors) for index in range(3))
+
+
+def grid_delta(reference_features: dict[str, Any], source_features: dict[str, Any], weight: float) -> float:
+    reference_grid = average_grid_mean_rgb(reference_features)
+    source_grid = average_grid_mean_rgb(source_features)
+    if reference_grid is None or source_grid is None or len(reference_grid) != len(source_grid):
+        return 0.0
+    distances = [
+        sqrt(sum((reference_cell[index] - source_cell[index]) ** 2 for index in range(3)))
+        for reference_cell, source_cell in zip(reference_grid, source_grid, strict=False)
+    ]
+    return average(distances) * weight
+
+
+def average_grid_mean_rgb(feature_document: dict[str, Any]) -> list[tuple[float, float, float]] | None:
+    frames = feature_document.get("features", [])
+    grids = [frame.get("grid_mean_rgb") for frame in frames if isinstance(frame, dict) and frame.get("grid_mean_rgb")]
+    if not grids:
+        return None
+    cell_count = len(grids[0])
+    if any(len(grid) != cell_count for grid in grids):
+        return None
+    averaged = []
+    for cell_index in range(cell_count):
+        averaged.append(tuple(sum(float(grid[cell_index][channel]) for grid in grids) / len(grids) for channel in range(3)))
+    return averaged
+
+
+def histogram_delta(reference_features: dict[str, Any], source_features: dict[str, Any], field: str, weight: float) -> float:
+    reference_histogram = average_histogram(reference_features, field)
+    source_histogram = average_histogram(source_features, field)
+    if reference_histogram is None or source_histogram is None or len(reference_histogram) != len(source_histogram):
+        return 0.0
+    return sum(abs(reference_histogram[index] - source_histogram[index]) for index in range(len(reference_histogram))) * weight
+
+
+def average_histogram(feature_document: dict[str, Any], field: str) -> list[float] | None:
+    frames = feature_document.get("features", [])
+    histograms = [frame.get(field) for frame in frames if isinstance(frame, dict) and frame.get(field)]
+    if not histograms:
+        return None
+    bin_count = len(histograms[0])
+    if any(len(histogram) != bin_count for histogram in histograms):
+        return None
+    return [sum(float(histogram[index]) for histogram in histograms) / len(histograms) for index in range(bin_count)]
+
+
+def brightest_frame_delta(reference_features: dict[str, Any], source_features: dict[str, Any], weight: float) -> float:
+    reference_vector = brightest_frame_mean_rgb(reference_features)
+    source_vector = brightest_frame_mean_rgb(source_features)
+    if reference_vector is None or source_vector is None:
+        return 0.0
+    return sqrt(sum((reference_vector[index] - source_vector[index]) ** 2 for index in range(3))) * weight
+
+
+def brightest_frame_mean_rgb(feature_document: dict[str, Any]) -> tuple[float, float, float] | None:
+    frames = [frame for frame in feature_document.get("features", []) if isinstance(frame, dict) and (frame.get("active_mean_rgb") or frame.get("mean_rgb"))]
+    if not frames:
+        return None
+    brightest = max(frames, key=lambda frame: float(frame.get("mean_luma") or 0.0))
+    vector = brightest.get("active_mean_rgb") or brightest.get("mean_rgb")
+    return tuple(float(value) for value in vector)
 
 
 def average_motion(feature_document: dict[str, Any]) -> float | None:
@@ -98,6 +167,12 @@ def average_optical_flow_scalar(feature_document: dict[str, Any], field: str) ->
     if not values:
         return None
     return sum(values) / len(values)
+
+
+def average(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return round(sum(values) / len(values), 6)
 
 
 def confidence_from_distance(distance: float | None) -> float:
