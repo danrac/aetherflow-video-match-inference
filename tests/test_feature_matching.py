@@ -40,6 +40,43 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertGreater(result["matches"][0]["reconstruction"]["parameters"]["distance"], 1.7)
             self.assertEqual(result["reference"]["duration_frames"], 24)
 
+    def test_feature_manifest_match_reconstructs_source_window_ranges(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-windows-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0], motion=3.0)
+            first_source_features = write_feature_manifest(
+                root / "first-source.features.json",
+                "first-source",
+                [101.0, 121.0, 141.0],
+                source_window={"source_in": 10, "source_out": 18},
+            )
+            second_source_features = write_feature_manifest(
+                root / "second-source.features.json",
+                "second-source",
+                [102.0, 122.0, 142.0],
+                source_window={"source_in": 40, "source_out": 56},
+            )
+
+            result = match(
+                MatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    source_paths=("/tmp/first-source.mp4", "/tmp/second-source.mp4"),
+                    model_manifest_path=str(model_manifest),
+                    reference_feature_manifest_path=str(reference_features),
+                    source_feature_manifest_paths=(str(first_source_features), str(second_source_features)),
+                )
+            )
+
+            self.assertEqual(result["matches"][0]["reference_in"], 0)
+            self.assertEqual(result["matches"][0]["reference_out"], 8)
+            self.assertEqual(result["matches"][0]["source_in"], 10)
+            self.assertEqual(result["matches"][0]["source_out"], 18)
+            self.assertEqual(result["matches"][1]["reference_in"], 8)
+            self.assertEqual(result["matches"][1]["reference_out"], 24)
+            self.assertEqual(result["matches"][1]["source_in"], 40)
+            self.assertEqual(result["matches"][1]["source_out"], 56)
+
     def test_match_falls_back_without_features(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-placeholder-") as temp_dir:
             model_manifest = write_model_manifest(Path(temp_dir))
@@ -214,7 +251,13 @@ def write_model_manifest(root: Path) -> Path:
     return path
 
 
-def write_feature_manifest(path: Path, clip_id: str, mean_rgb: list[float], motion: float | None = None) -> Path:
+def write_feature_manifest(
+    path: Path,
+    clip_id: str,
+    mean_rgb: list[float],
+    motion: float | None = None,
+    source_window: dict | None = None,
+) -> Path:
     frame = {
         "frame_index": 0,
         "mean_rgb": mean_rgb,
@@ -222,18 +265,18 @@ def write_feature_manifest(path: Path, clip_id: str, mean_rgb: list[float], moti
     }
     if motion is not None:
         frame["mean_absdiff_from_previous"] = motion
-    write_json(
-        path,
-        {
-            "clip_id": clip_id,
-            "checksum": "abc123",
-            "feature_version": "opencv-visual-stats-v2",
-            "duration_frames": 24,
-            "fps": 24.0,
-            "sampled_frame_count": 1,
-            "features": [frame],
-        },
-    )
+    document = {
+        "clip_id": clip_id,
+        "checksum": "abc123",
+        "feature_version": "opencv-visual-stats-v2",
+        "duration_frames": 24,
+        "fps": 24.0,
+        "sampled_frame_count": 1,
+        "features": [frame],
+    }
+    if source_window is not None:
+        document["source_window"] = source_window
+    write_json(path, document)
     return path
 
 

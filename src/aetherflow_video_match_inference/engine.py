@@ -83,19 +83,32 @@ def match_from_feature_manifests(request: MatchRequest, model_manifest: dict) ->
     matches = []
     reference_duration = int(reference_features.get("duration_frames", 0) or 0)
     reference_fps = float(reference_features.get("fps", 24.0) or 24.0)
+    source_window_lengths = [source_window_length(feature_document) for feature_document in source_features]
+    total_window_length = sum(source_window_lengths)
+    reference_cursor = 0
 
     for index, source_path in enumerate(request.source_paths):
         feature_document = source_features[index] if index < len(source_features) else {}
         distance = color_distance(reference_features, feature_document)
-        source_duration = int(feature_document.get("duration_frames", 0) or reference_duration or 1)
-        match_frames = max(1, min(reference_duration or source_duration, source_duration))
+        source_in, source_out = source_range(feature_document, reference_duration)
+        source_duration = max(1, source_out - source_in)
+        if total_window_length > 0 and reference_duration > 0:
+            if index == len(request.source_paths) - 1:
+                reference_out = reference_duration
+            else:
+                reference_out = min(reference_duration, reference_cursor + max(1, round(reference_duration * source_window_lengths[index] / total_window_length)))
+            reference_in = reference_cursor
+            reference_cursor = reference_out
+        else:
+            reference_in = 0
+            reference_out = max(1, min(reference_duration or source_duration, source_duration))
         matches.append(
             {
                 "source_path": source_path,
-                "reference_in": 0,
-                "reference_out": match_frames,
-                "source_in": 0,
-                "source_out": match_frames,
+                "reference_in": reference_in,
+                "reference_out": reference_out,
+                "source_in": source_in,
+                "source_out": source_out,
                 "timeline_track": 0,
                 "confidence": confidence_from_distance(distance),
                 "reconstruction": {
@@ -103,6 +116,7 @@ def match_from_feature_manifests(request: MatchRequest, model_manifest: dict) ->
                     "parameters": {
                         "feature_version": feature_document.get("feature_version", "unknown"),
                         "distance": distance,
+                        "source_window": feature_document.get("source_window"),
                     },
                 },
             }
@@ -119,3 +133,21 @@ def match_from_feature_manifests(request: MatchRequest, model_manifest: dict) ->
         },
         "matches": matches,
     }
+
+
+def source_window_length(feature_document: dict) -> int:
+    source_window = feature_document.get("source_window")
+    if not isinstance(source_window, dict):
+        return 0
+    return max(0, int(source_window.get("source_out", 0)) - int(source_window.get("source_in", 0)))
+
+
+def source_range(feature_document: dict, fallback_duration: int) -> tuple[int, int]:
+    source_window = feature_document.get("source_window")
+    if isinstance(source_window, dict):
+        source_in = int(source_window.get("source_in", 0))
+        source_out = int(source_window.get("source_out", source_in + 1))
+        if source_out > source_in:
+            return source_in, source_out
+    duration = int(feature_document.get("duration_frames", 0) or fallback_duration or 1)
+    return 0, max(1, duration)
