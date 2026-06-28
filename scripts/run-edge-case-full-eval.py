@@ -434,23 +434,24 @@ def picture_in_picture_geometry(parameters: dict) -> dict | None:
 def project_picture_in_picture_grid(base_grid: list[tuple[float, float, float]], pip_grid: list[tuple[float, float, float]], geometry: dict, grid_size: int) -> list[tuple[float, float, float]]:
     output_width = geometry["output_width"]
     output_height = geometry["output_height"]
-    pip_x = geometry["x"]
-    pip_y = geometry["y"]
-    pip_width = geometry["width"]
-    pip_height = geometry["height"]
+    pip_rect = (geometry["x"], geometry["y"], geometry["x"] + geometry["width"], geometry["y"] + geometry["height"])
     projected = []
     for row in range(grid_size):
-        center_y = (row + 0.5) * output_height / grid_size
+        cell_y0 = row * output_height / grid_size
+        cell_y1 = (row + 1) * output_height / grid_size
         for column in range(grid_size):
-            center_x = (column + 0.5) * output_width / grid_size
-            if pip_x <= center_x <= pip_x + pip_width and pip_y <= center_y <= pip_y + pip_height:
-                source_x = max(0.0, min(0.999999, (center_x - pip_x) / pip_width))
-                source_y = max(0.0, min(0.999999, (center_y - pip_y) / pip_height))
-                source_column = min(grid_size - 1, int(source_x * grid_size))
-                source_row = min(grid_size - 1, int(source_y * grid_size))
-                projected.append(pip_grid[source_row * grid_size + source_column])
+            cell_x0 = column * output_width / grid_size
+            cell_x1 = (column + 1) * output_width / grid_size
+            base_color = sample_grid_region(base_grid, grid_size, column / grid_size, row / grid_size, (column + 1) / grid_size, (row + 1) / grid_size)
+            overlap = rect_intersection((cell_x0, cell_y0, cell_x1, cell_y1), pip_rect)
+            if overlap is None:
+                projected.append(base_color)
             else:
-                projected.append(base_grid[row * grid_size + column])
+                overlap_area = rect_area(overlap)
+                cell_area = rect_area((cell_x0, cell_y0, cell_x1, cell_y1))
+                pip_color = sample_projected_region(pip_grid, grid_size, geometry, overlap)
+                pip_weight = overlap_area / cell_area if cell_area > 0 else 0.0
+                projected.append(tuple(base_color[index] * (1.0 - pip_weight) + pip_color[index] * pip_weight for index in range(3)))
     return projected
 
 
@@ -544,24 +545,81 @@ def projected_grid_distance(reference_features: dict, source_features: dict, geo
 def project_source_grid(source_grid: list[tuple[float, float, float]], geometry: dict, grid_size: int) -> list[tuple[float, float, float]]:
     output_width = geometry["output_width"]
     output_height = geometry["output_height"]
+    source_rect = (geometry["x"], geometry["y"], geometry["x"] + geometry["width"], geometry["y"] + geometry["height"])
+    projected = []
+    for row in range(grid_size):
+        cell_y0 = row * output_height / grid_size
+        cell_y1 = (row + 1) * output_height / grid_size
+        for column in range(grid_size):
+            cell_x0 = column * output_width / grid_size
+            cell_x1 = (column + 1) * output_width / grid_size
+            overlap = rect_intersection((cell_x0, cell_y0, cell_x1, cell_y1), source_rect)
+            if overlap is None:
+                projected.append((0.0, 0.0, 0.0))
+                continue
+            overlap_area = rect_area(overlap)
+            cell_area = rect_area((cell_x0, cell_y0, cell_x1, cell_y1))
+            source_color = sample_projected_region(source_grid, grid_size, geometry, overlap)
+            source_weight = overlap_area / cell_area if cell_area > 0 else 0.0
+            projected.append(tuple(source_color[index] * source_weight for index in range(3)))
+    return projected
+
+
+def sample_projected_region(grid: list[tuple[float, float, float]], grid_size: int, geometry: dict, output_rect: tuple[float, float, float, float]) -> tuple[float, float, float]:
     x = geometry["x"]
     y = geometry["y"]
     width = geometry["width"]
     height = geometry["height"]
-    projected = []
+    return sample_grid_region(
+        grid,
+        grid_size,
+        (output_rect[0] - x) / width,
+        (output_rect[1] - y) / height,
+        (output_rect[2] - x) / width,
+        (output_rect[3] - y) / height,
+    )
+
+
+def sample_grid_region(grid: list[tuple[float, float, float]], grid_size: int, x0: float, y0: float, x1: float, y1: float) -> tuple[float, float, float]:
+    x0 = max(0.0, min(1.0, x0))
+    y0 = max(0.0, min(1.0, y0))
+    x1 = max(0.0, min(1.0, x1))
+    y1 = max(0.0, min(1.0, y1))
+    if x1 <= x0 or y1 <= y0:
+        return (0.0, 0.0, 0.0)
+    totals = [0.0, 0.0, 0.0]
+    total_area = 0.0
     for row in range(grid_size):
-        center_y = (row + 0.5) * output_height / grid_size
+        cell_y0 = row / grid_size
+        cell_y1 = (row + 1) / grid_size
         for column in range(grid_size):
-            center_x = (column + 0.5) * output_width / grid_size
-            if center_x < x or center_x > x + width or center_y < y or center_y > y + height:
-                projected.append((0.0, 0.0, 0.0))
+            cell_x0 = column / grid_size
+            cell_x1 = (column + 1) / grid_size
+            overlap = rect_intersection((x0, y0, x1, y1), (cell_x0, cell_y0, cell_x1, cell_y1))
+            if overlap is None:
                 continue
-            source_x = max(0.0, min(0.999999, (center_x - x) / width))
-            source_y = max(0.0, min(0.999999, (center_y - y) / height))
-            source_column = min(grid_size - 1, int(source_x * grid_size))
-            source_row = min(grid_size - 1, int(source_y * grid_size))
-            projected.append(source_grid[source_row * grid_size + source_column])
-    return projected
+            area = rect_area(overlap)
+            color = grid[row * grid_size + column]
+            for index in range(3):
+                totals[index] += color[index] * area
+            total_area += area
+    if total_area <= 0:
+        return (0.0, 0.0, 0.0)
+    return tuple(value / total_area for value in totals)
+
+
+def rect_intersection(first: tuple[float, float, float, float], second: tuple[float, float, float, float]) -> tuple[float, float, float, float] | None:
+    x0 = max(first[0], second[0])
+    y0 = max(first[1], second[1])
+    x1 = min(first[2], second[2])
+    y1 = min(first[3], second[3])
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def rect_area(rect: tuple[float, float, float, float]) -> float:
+    return max(0.0, rect[2] - rect[0]) * max(0.0, rect[3] - rect[1])
 
 
 def square_grid_size(grid: list[tuple[float, float, float]]) -> int | None:
