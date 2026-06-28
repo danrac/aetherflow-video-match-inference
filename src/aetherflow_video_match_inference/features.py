@@ -67,7 +67,7 @@ def grid_delta(reference_features: dict[str, Any], source_features: dict[str, An
 
 def average_grid_mean_rgb(feature_document: dict[str, Any]) -> list[tuple[float, float, float]] | None:
     frames = feature_document.get("features", [])
-    grids = [frame.get("grid_mean_rgb") for frame in frames if isinstance(frame, dict) and frame.get("grid_mean_rgb")]
+    grids = [frame.get("grid_mean_rgb_5x5") or frame.get("grid_mean_rgb") for frame in frames if isinstance(frame, dict) and (frame.get("grid_mean_rgb_5x5") or frame.get("grid_mean_rgb"))]
     if not grids:
         return None
     cell_count = len(grids[0])

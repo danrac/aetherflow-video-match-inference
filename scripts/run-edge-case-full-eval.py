@@ -310,7 +310,7 @@ def average_grid(grids: list) -> list[list[float]] | None:
 
 def average_grid_mean_rgb(feature_document: dict) -> list[tuple[float, float, float]] | None:
     frames = feature_document.get("features", [])
-    grid = average_grid([frame.get("grid_mean_rgb") for frame in frames if isinstance(frame, dict)])
+    grid = average_grid([frame.get("grid_mean_rgb_5x5") or frame.get("grid_mean_rgb") for frame in frames if isinstance(frame, dict) and (frame.get("grid_mean_rgb_5x5") or frame.get("grid_mean_rgb"))])
     if grid is None:
         return None
     return [tuple(float(value) for value in cell) for cell in grid]
@@ -403,9 +403,12 @@ def picture_in_picture_overlay_distance(reference_features: dict, feature_docume
     reference_grid = average_grid_mean_rgb(reference_features)
     base_grid = average_grid_mean_rgb(feature_documents[0])
     pip_grid = average_grid_mean_rgb(feature_documents[1])
-    if reference_grid is None or base_grid is None or pip_grid is None or len(reference_grid) != 9 or len(base_grid) != 9 or len(pip_grid) != 9:
+    if reference_grid is None or base_grid is None or pip_grid is None or len(reference_grid) != len(base_grid) or len(reference_grid) != len(pip_grid):
         return None
-    projected_grid = project_picture_in_picture_grid(base_grid, pip_grid, geometry)
+    grid_size = square_grid_size(reference_grid)
+    if grid_size is None:
+        return None
+    projected_grid = project_picture_in_picture_grid(base_grid, pip_grid, geometry, grid_size)
     distances = [
         sqrt(sum((reference_cell[index] - projected_cell[index]) ** 2 for index in range(3)))
         for reference_cell, projected_cell in zip(reference_grid, projected_grid, strict=False)
@@ -428,7 +431,7 @@ def picture_in_picture_geometry(parameters: dict) -> dict | None:
     return {"output_width": output_width, "output_height": output_height, "x": pip_x, "y": pip_y, "width": pip_width, "height": pip_height}
 
 
-def project_picture_in_picture_grid(base_grid: list[tuple[float, float, float]], pip_grid: list[tuple[float, float, float]], geometry: dict) -> list[tuple[float, float, float]]:
+def project_picture_in_picture_grid(base_grid: list[tuple[float, float, float]], pip_grid: list[tuple[float, float, float]], geometry: dict, grid_size: int) -> list[tuple[float, float, float]]:
     output_width = geometry["output_width"]
     output_height = geometry["output_height"]
     pip_x = geometry["x"]
@@ -436,18 +439,18 @@ def project_picture_in_picture_grid(base_grid: list[tuple[float, float, float]],
     pip_width = geometry["width"]
     pip_height = geometry["height"]
     projected = []
-    for row in range(3):
-        center_y = (row + 0.5) * output_height / 3.0
-        for column in range(3):
-            center_x = (column + 0.5) * output_width / 3.0
+    for row in range(grid_size):
+        center_y = (row + 0.5) * output_height / grid_size
+        for column in range(grid_size):
+            center_x = (column + 0.5) * output_width / grid_size
             if pip_x <= center_x <= pip_x + pip_width and pip_y <= center_y <= pip_y + pip_height:
                 source_x = max(0.0, min(0.999999, (center_x - pip_x) / pip_width))
                 source_y = max(0.0, min(0.999999, (center_y - pip_y) / pip_height))
-                source_column = min(2, int(source_x * 3))
-                source_row = min(2, int(source_y * 3))
-                projected.append(pip_grid[source_row * 3 + source_column])
+                source_column = min(grid_size - 1, int(source_x * grid_size))
+                source_row = min(grid_size - 1, int(source_y * grid_size))
+                projected.append(pip_grid[source_row * grid_size + source_column])
             else:
-                projected.append(base_grid[row * 3 + column])
+                projected.append(base_grid[row * grid_size + column])
     return projected
 
 
@@ -525,9 +528,12 @@ def projected_grid_distance(reference_features: dict, source_features: dict, geo
         return None
     reference_grid = average_grid_mean_rgb(reference_features)
     source_grid = average_grid_mean_rgb(source_features)
-    if reference_grid is None or source_grid is None or len(reference_grid) != 9 or len(source_grid) != 9:
+    if reference_grid is None or source_grid is None or len(reference_grid) != len(source_grid):
         return None
-    projected_grid = project_source_grid(source_grid, geometry)
+    grid_size = square_grid_size(source_grid)
+    if grid_size is None:
+        return None
+    projected_grid = project_source_grid(source_grid, geometry, grid_size)
     distances = [
         sqrt(sum((reference_cell[index] - projected_cell[index]) ** 2 for index in range(3)))
         for reference_cell, projected_cell in zip(reference_grid, projected_grid, strict=False)
@@ -535,7 +541,7 @@ def projected_grid_distance(reference_features: dict, source_features: dict, geo
     return average(distances) * 0.2
 
 
-def project_source_grid(source_grid: list[tuple[float, float, float]], geometry: dict) -> list[tuple[float, float, float]]:
+def project_source_grid(source_grid: list[tuple[float, float, float]], geometry: dict, grid_size: int) -> list[tuple[float, float, float]]:
     output_width = geometry["output_width"]
     output_height = geometry["output_height"]
     x = geometry["x"]
@@ -543,19 +549,24 @@ def project_source_grid(source_grid: list[tuple[float, float, float]], geometry:
     width = geometry["width"]
     height = geometry["height"]
     projected = []
-    for row in range(3):
-        center_y = (row + 0.5) * output_height / 3.0
-        for column in range(3):
-            center_x = (column + 0.5) * output_width / 3.0
+    for row in range(grid_size):
+        center_y = (row + 0.5) * output_height / grid_size
+        for column in range(grid_size):
+            center_x = (column + 0.5) * output_width / grid_size
             if center_x < x or center_x > x + width or center_y < y or center_y > y + height:
                 projected.append((0.0, 0.0, 0.0))
                 continue
             source_x = max(0.0, min(0.999999, (center_x - x) / width))
             source_y = max(0.0, min(0.999999, (center_y - y) / height))
-            source_column = min(2, int(source_x * 3))
-            source_row = min(2, int(source_y * 3))
-            projected.append(source_grid[source_row * 3 + source_column])
+            source_column = min(grid_size - 1, int(source_x * grid_size))
+            source_row = min(grid_size - 1, int(source_y * grid_size))
+            projected.append(source_grid[source_row * grid_size + source_column])
     return projected
+
+
+def square_grid_size(grid: list[tuple[float, float, float]]) -> int | None:
+    size = round(sqrt(len(grid)))
+    return size if size > 0 and size * size == len(grid) else None
 
 
 def average_optional_scalar(values: list) -> float | None:
