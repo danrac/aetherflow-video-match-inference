@@ -141,11 +141,16 @@ def rank_candidate_groups(reference_features: dict, candidates: list[dict], refe
             if "simple_cut" in reference_transform_types and is_segment_sequence_group(ordered_features)
             else None
         )
+        pip_overlay_distance = (
+            picture_in_picture_overlay_distance(reference_features, ordered_features, reference_transforms)
+            if "picture_in_picture" in reference_transform_types and is_parallel_contributor_group(group_candidates)
+            else None
+        )
         spatial_distance = spatial_transform_distance(reference_features, combined_features, reference_transforms) if combined_features is not None else None
         finite_distances = [float(item["distance"]) for item in scored_windows if item["distance"] != float("inf")]
         average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
         tail_distance = tail_visual_distance(reference_features, combined_features, start_fraction=0.7) if combined_features is not None else None
-        group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance, spatial_distance)
+        group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance, spatial_distance, pip_overlay_distance)
         clip_ids = sorted({item["clip_id"] for item in scored_windows})
         family_penalty = candidate_family_penalty(ordered_features, reference_transform_types)
         ranked.append(
@@ -383,6 +388,67 @@ def spatial_transform_distance(reference_features: dict, source_features: dict, 
     if not distances:
         return None
     return min(distances)
+
+
+def picture_in_picture_overlay_distance(reference_features: dict, feature_documents: list[dict], transforms: list[dict]) -> float | None:
+    if len(feature_documents) < 2:
+        return None
+    transform = next((transform for transform in transforms if transform.get("type") == "picture_in_picture"), None)
+    if not isinstance(transform, dict):
+        return None
+    parameters = transform.get("parameters") if isinstance(transform.get("parameters"), dict) else {}
+    geometry = picture_in_picture_geometry(parameters)
+    if geometry is None:
+        return None
+    reference_grid = average_grid_mean_rgb(reference_features)
+    base_grid = average_grid_mean_rgb(feature_documents[0])
+    pip_grid = average_grid_mean_rgb(feature_documents[1])
+    if reference_grid is None or base_grid is None or pip_grid is None or len(reference_grid) != 9 or len(base_grid) != 9 or len(pip_grid) != 9:
+        return None
+    projected_grid = project_picture_in_picture_grid(base_grid, pip_grid, geometry)
+    distances = [
+        sqrt(sum((reference_cell[index] - projected_cell[index]) ** 2 for index in range(3)))
+        for reference_cell, projected_cell in zip(reference_grid, projected_grid, strict=False)
+    ]
+    return average(distances) * 0.2
+
+
+def picture_in_picture_geometry(parameters: dict) -> dict | None:
+    try:
+        output_width = float(parameters["output_width"])
+        output_height = float(parameters["output_height"])
+        pip_width = float(parameters["width"])
+        pip_height = float(parameters["height"])
+        pip_x = float(parameters["x"])
+        pip_y = float(parameters["y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if min(output_width, output_height, pip_width, pip_height) <= 0:
+        return None
+    return {"output_width": output_width, "output_height": output_height, "x": pip_x, "y": pip_y, "width": pip_width, "height": pip_height}
+
+
+def project_picture_in_picture_grid(base_grid: list[tuple[float, float, float]], pip_grid: list[tuple[float, float, float]], geometry: dict) -> list[tuple[float, float, float]]:
+    output_width = geometry["output_width"]
+    output_height = geometry["output_height"]
+    pip_x = geometry["x"]
+    pip_y = geometry["y"]
+    pip_width = geometry["width"]
+    pip_height = geometry["height"]
+    projected = []
+    for row in range(3):
+        center_y = (row + 0.5) * output_height / 3.0
+        for column in range(3):
+            center_x = (column + 0.5) * output_width / 3.0
+            if pip_x <= center_x <= pip_x + pip_width and pip_y <= center_y <= pip_y + pip_height:
+                source_x = max(0.0, min(0.999999, (center_x - pip_x) / pip_width))
+                source_y = max(0.0, min(0.999999, (center_y - pip_y) / pip_height))
+                source_column = min(2, int(source_x * 3))
+                source_row = min(2, int(source_y * 3))
+                projected.append(pip_grid[source_row * 3 + source_column])
+            else:
+                projected.append(base_grid[row * 3 + column])
+    return projected
 
 
 def scale_position_geometry(parameters: dict) -> dict | None:
