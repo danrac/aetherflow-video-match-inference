@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import sys
 
-from aetherflow_video_match_inference.features import color_distance, load_feature_manifest
+from aetherflow_video_match_inference.features import color_distance, load_feature_manifest, temporal_signature_row
 
 
 DATA_ROOT = Path(os.environ.get("AETHERFLOW_VIDEO_MATCH_DATA_ROOT", "/Volumes/FrameFusion/AetherFlow_VideoMatcherData"))
@@ -33,7 +33,7 @@ def main(argv: list[str]) -> int:
         ground_truth = load_json(root / sample["ground_truth_path"])
         expected_clip_ids = source_clip_ids_from_ground_truth(ground_truth)
         ranked = rank_candidates(reference_features, candidate_features)
-        expected_ranks = [index + 1 for index, candidate in enumerate(ranked) if candidate["clip_id"] in expected_clip_ids]
+        expected_ranks = [index + 1 for index, candidate in enumerate(ranked) if ranked_item_matches_expected(candidate, expected_clip_ids)]
         if not expected_ranks:
             continue
         best_rank = min(expected_ranks)
@@ -45,6 +45,8 @@ def main(argv: list[str]) -> int:
                 "best_expected_rank": best_rank,
                 "top_candidate_id": ranked[0]["candidate_id"],
                 "top_clip_id": ranked[0]["clip_id"],
+                "top_candidate_clip_ids": ranked[0].get("clip_ids", []),
+                "top_candidate_window_count": ranked[0].get("window_count", 1),
                 "top_distance": ranked[0]["distance"],
                 "top1_correct": best_rank == 1,
                 "top5_correct": best_rank <= 5,
@@ -73,6 +75,7 @@ def load_source_window_candidates(root: Path, dataset: dict) -> list[dict]:
             candidates.append(
                 {
                     "candidate_id": f"{sample['sample_id']}:{index}:{entry['source_clip_id']}:{entry['source_in']}-{entry['source_out']}",
+                    "candidate_group_id": str(sample["sample_id"]),
                     "clip_id": str(entry["source_clip_id"]),
                     "features": feature_document,
                 }
@@ -81,6 +84,8 @@ def load_source_window_candidates(root: Path, dataset: dict) -> list[dict]:
 
 
 def rank_candidates(reference_features: dict, candidates: list[dict]) -> list[dict]:
+    if any(candidate.get("candidate_group_id") for candidate in candidates):
+        return rank_candidate_groups(reference_features, candidates)
     ranked = []
     for candidate in candidates:
         distance = color_distance(reference_features, candidate["features"])
@@ -92,6 +97,79 @@ def rank_candidates(reference_features: dict, candidates: list[dict]) -> list[di
             }
         )
     return sorted(ranked, key=lambda item: (float(item["distance"]), item["clip_id"], item["candidate_id"]))
+
+
+def rank_candidate_groups(reference_features: dict, candidates: list[dict]) -> list[dict]:
+    grouped = defaultdict(list)
+    for candidate in candidates:
+        grouped[str(candidate.get("candidate_group_id") or candidate["candidate_id"])].append(candidate)
+
+    ranked = []
+    for group_id, group_candidates in grouped.items():
+        scored_windows = []
+        ordered_features = []
+        for candidate in group_candidates:
+            ordered_features.append(candidate["features"])
+            distance = color_distance(reference_features, candidate["features"])
+            scored_windows.append(
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "clip_id": candidate["clip_id"],
+                    "distance": distance if distance is not None else float("inf"),
+                }
+            )
+        combined_features = combine_feature_documents(ordered_features)
+        combined_distance = color_distance(reference_features, combined_features) if combined_features is not None else None
+        finite_distances = [float(item["distance"]) for item in scored_windows if item["distance"] != float("inf")]
+        average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
+        group_distance = best_group_distance(combined_distance, average_window_distance)
+        clip_ids = sorted({item["clip_id"] for item in scored_windows})
+        ranked.append(
+            {
+                "candidate_id": group_id,
+                "clip_id": clip_ids[0] if clip_ids else group_id,
+                "clip_ids": clip_ids,
+                "distance": round(group_distance, 6) if group_distance != float("inf") else float("inf"),
+                "window_count": len(scored_windows),
+                "window_candidates": sorted(scored_windows, key=lambda item: (float(item["distance"]), item["candidate_id"])),
+            }
+        )
+    return sorted(ranked, key=lambda item: (float(item["distance"]), item["candidate_id"]))
+
+
+def combine_feature_documents(feature_documents: list[dict]) -> dict | None:
+    frames = []
+    for document in feature_documents:
+        frames.extend(frame for frame in document.get("features", []) if isinstance(frame, dict))
+    if not frames:
+        return None
+    return {"features": frames, "temporal_signature": binned_temporal_signature(frames, bins=8)}
+
+
+def binned_temporal_signature(frames: list[dict], bins: int) -> list[list[float]]:
+    if bins <= 0 or not frames:
+        return []
+    if len(frames) == 1:
+        return [temporal_signature_row(frames[0]) for _ in range(bins)]
+    signature = []
+    last_index = len(frames) - 1
+    for bin_index in range(bins):
+        signature.append(temporal_signature_row(frames[round(bin_index * last_index / (bins - 1))]))
+    return signature
+
+
+def best_group_distance(combined_distance: float | None, average_window_distance: float | None) -> float:
+    distances = [distance for distance in [combined_distance, average_window_distance] if distance is not None and distance != float("inf")]
+    if not distances:
+        return float("inf")
+    return min(distances)
+
+
+def ranked_item_matches_expected(item: dict, expected_clip_ids: set[str]) -> bool:
+    clip_ids = set(item.get("clip_ids") or [])
+    if not clip_ids and item.get("clip_id"):
+        clip_ids.add(str(item["clip_id"]))
+    return bool(clip_ids & expected_clip_ids)
 
 
 def metrics(results: list[dict]) -> dict:
