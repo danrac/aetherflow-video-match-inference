@@ -121,7 +121,11 @@ class FeatureMatchingTests(unittest.TestCase):
             "features": [
                 {
                     "mean_rgb": [100.0, 120.0, 140.0],
+                    "mean_luma": 118.0,
+                    "edge_density": 0.10,
+                    "scene_change_score": 2.0,
                     "mean_absdiff_from_previous": 2.0,
+                    "optical_flow": {"mean_magnitude": 0.25, "mean_dx": 0.10, "mean_dy": 0.02},
                 }
             ]
         }

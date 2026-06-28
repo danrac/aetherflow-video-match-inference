@@ -30,6 +30,7 @@ def visual_distance(reference_features: dict[str, Any], source_features: dict[st
         color_component
         + grid_delta(reference_features, source_features, weight=0.35)
         + histogram_delta(reference_features, source_features, "active_hue_histogram", weight=80.0)
+        + temporal_signature_delta(reference_features, source_features, weight=120.0)
         + brightest_frame_delta(reference_features, source_features, weight=0.4)
         + scalar_delta(reference_features, source_features, "mean_absdiff_from_previous", weight=1.0)
         + scalar_delta(reference_features, source_features, "mean_luma", weight=0.25)
@@ -95,6 +96,50 @@ def average_histogram(feature_document: dict[str, Any], field: str) -> list[floa
     if any(len(histogram) != bin_count for histogram in histograms):
         return None
     return [sum(float(histogram[index]) for histogram in histograms) / len(histograms) for index in range(bin_count)]
+
+
+def temporal_signature_delta(reference_features: dict[str, Any], source_features: dict[str, Any], weight: float) -> float:
+    reference_signature = temporal_signature(reference_features)
+    source_signature = temporal_signature(source_features)
+    if reference_signature is None or source_signature is None:
+        return 0.0
+    rows = min(len(reference_signature), len(source_signature))
+    if rows == 0:
+        return 0.0
+    distances = []
+    for row_index in range(rows):
+        reference_row = reference_signature[row_index]
+        source_row = source_signature[row_index]
+        columns = min(len(reference_row), len(source_row))
+        if columns == 0:
+            continue
+        distances.append(sum(abs(reference_row[column] - source_row[column]) for column in range(columns)) / columns)
+    return average(distances) * weight
+
+
+def temporal_signature(feature_document: dict[str, Any]) -> list[list[float]] | None:
+    signature = feature_document.get("temporal_signature")
+    if isinstance(signature, list) and signature and all(isinstance(row, list) for row in signature):
+        return [[float(value) for value in row] for row in signature]
+    frames = [frame for frame in feature_document.get("features", []) if isinstance(frame, dict)]
+    if not frames:
+        return None
+    return [temporal_signature_row(frame) for frame in frames]
+
+
+def temporal_signature_row(frame: dict[str, Any]) -> list[float]:
+    active_rgb = frame.get("active_mean_rgb") or frame.get("mean_rgb") or [0.0, 0.0, 0.0]
+    flow = frame.get("optical_flow") if isinstance(frame.get("optical_flow"), dict) else {}
+    return [
+        float(frame.get("mean_luma") or 0.0) / 255.0,
+        float(frame.get("std_luma") or 0.0) / 128.0,
+        float(frame.get("edge_density") or 0.0),
+        float(frame.get("mean_absdiff_from_previous") or 0.0) / 255.0,
+        float(flow.get("mean_magnitude") or 0.0) / 255.0,
+        float(active_rgb[0]) / 255.0,
+        float(active_rgb[1]) / 255.0,
+        float(active_rgb[2]) / 255.0,
+    ]
 
 
 def brightest_frame_delta(reference_features: dict[str, Any], source_features: dict[str, Any], weight: float) -> float:
