@@ -145,6 +145,24 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertEqual(visual_distance(reference, source_without_v3_delta), 0.0)
         self.assertGreater(visual_distance(reference, source_with_v3_delta), 20.0)
 
+    def test_feature_distance_accepts_reversed_temporal_signature_and_flow_direction(self) -> None:
+        reference = {
+            "features": [{"mean_rgb": [100.0, 120.0, 140.0]}],
+            "temporal_signature": [
+                [0.10, 0.02, 0.01, 0.00, 0.03, 0.20, 0.30, 0.40],
+                [0.80, 0.04, 0.03, 0.02, 0.05, 0.70, 0.60, 0.50],
+            ],
+        }
+        source_reversed = {
+            "features": [{"mean_rgb": [100.0, 120.0, 140.0]}],
+            "temporal_signature": list(reversed(reference["temporal_signature"])),
+        }
+        reference_with_flow = {"features": [{"mean_rgb": [1.0, 1.0, 1.0], "optical_flow": {"mean_magnitude": 2.0, "mean_dx": 0.5, "mean_dy": -0.25}}]}
+        source_with_opposite_flow = {"features": [{"mean_rgb": [1.0, 1.0, 1.0], "optical_flow": {"mean_magnitude": 2.0, "mean_dx": -0.5, "mean_dy": 0.25}}]}
+
+        self.assertEqual(visual_distance(reference, source_reversed), 0.0)
+        self.assertEqual(visual_distance(reference_with_flow, source_with_opposite_flow), 0.0)
+
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
             model_manifest = write_model_manifest(Path(temp_dir))

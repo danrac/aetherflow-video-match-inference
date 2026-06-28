@@ -103,6 +103,13 @@ def temporal_signature_delta(reference_features: dict[str, Any], source_features
     source_signature = temporal_signature(source_features)
     if reference_signature is None or source_signature is None:
         return 0.0
+    return min(
+        temporal_signature_distance(reference_signature, source_signature),
+        temporal_signature_distance(reference_signature, list(reversed(source_signature))),
+    ) * weight
+
+
+def temporal_signature_distance(reference_signature: list[list[float]], source_signature: list[list[float]]) -> float:
     rows = min(len(reference_signature), len(source_signature))
     if rows == 0:
         return 0.0
@@ -114,7 +121,7 @@ def temporal_signature_delta(reference_features: dict[str, Any], source_features
         if columns == 0:
             continue
         distances.append(sum(abs(reference_row[column] - source_row[column]) for column in range(columns)) / columns)
-    return average(distances) * weight
+    return average(distances)
 
 
 def temporal_signature(feature_document: dict[str, Any]) -> list[list[float]] | None:
@@ -196,6 +203,8 @@ def scalar_delta_from_flow(reference_features: dict[str, Any], source_features: 
     source_value = average_optical_flow_scalar(source_features, field)
     if reference_value is None or source_value is None:
         return 0.0
+    if field in {"mean_dx", "mean_dy"}:
+        return min(abs(reference_value - source_value), abs(reference_value + source_value)) * weight
     return abs(reference_value - source_value) * weight
 
 
