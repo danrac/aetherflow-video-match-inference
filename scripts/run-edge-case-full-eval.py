@@ -122,7 +122,8 @@ def rank_candidate_groups(reference_features: dict, candidates: list[dict]) -> l
         combined_distance = color_distance(reference_features, combined_features) if combined_features is not None else None
         finite_distances = [float(item["distance"]) for item in scored_windows if item["distance"] != float("inf")]
         average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
-        group_distance = best_group_distance(combined_distance, average_window_distance)
+        tail_distance = tail_visual_distance(reference_features, combined_features, start_fraction=0.7) if combined_features is not None else None
+        group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance)
         clip_ids = sorted({item["clip_id"] for item in scored_windows})
         ranked.append(
             {
@@ -158,8 +159,27 @@ def binned_temporal_signature(frames: list[dict], bins: int) -> list[list[float]
     return signature
 
 
-def best_group_distance(combined_distance: float | None, average_window_distance: float | None) -> float:
-    distances = [distance for distance in [combined_distance, average_window_distance] if distance is not None and distance != float("inf")]
+def tail_visual_distance(reference_features: dict, source_features: dict, start_fraction: float) -> float | None:
+    reference_tail = tail_feature_document(reference_features, start_fraction)
+    source_tail = tail_feature_document(source_features, start_fraction)
+    if reference_tail is None or source_tail is None:
+        return None
+    return color_distance(reference_tail, source_tail)
+
+
+def tail_feature_document(feature_document: dict, start_fraction: float) -> dict | None:
+    frames = [frame for frame in feature_document.get("features", []) if isinstance(frame, dict)]
+    if not frames:
+        return None
+    start_index = max(0, min(len(frames) - 1, round(len(frames) * start_fraction)))
+    tail_frames = frames[start_index:]
+    if not tail_frames:
+        return None
+    return {"features": tail_frames}
+
+
+def best_group_distance(*distances: float | None) -> float:
+    distances = [distance for distance in distances if distance is not None and distance != float("inf")]
     if not distances:
         return float("inf")
     return min(distances)
