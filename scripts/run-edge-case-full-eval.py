@@ -74,6 +74,7 @@ def load_source_window_candidates(root: Path, dataset: dict) -> list[dict]:
     for sample in dataset.get("samples", []):
         for index, entry in enumerate(sample.get("source_window_feature_manifests", [])):
             feature_document = load_feature_manifest(root / entry["path"])
+            feature_document["source_window_entry"] = entry
             candidates.append(
                 {
                     "candidate_id": f"{sample['sample_id']}:{index}:{entry['source_clip_id']}:{entry['source_in']}-{entry['source_out']}",
@@ -130,17 +131,24 @@ def rank_candidate_groups(reference_features: dict, candidates: list[dict], refe
             if "split_screen" in reference_transform_types and is_parallel_contributor_group(group_candidates)
             else None
         )
+        segment_sequence_distance = (
+            simple_cut_segment_sequence_distance(reference_features, ordered_features)
+            if "simple_cut" in reference_transform_types and is_segment_sequence_group(ordered_features)
+            else None
+        )
         finite_distances = [float(item["distance"]) for item in scored_windows if item["distance"] != float("inf")]
         average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
         tail_distance = tail_visual_distance(reference_features, combined_features, start_fraction=0.7) if combined_features is not None else None
-        group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance)
+        group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance)
         clip_ids = sorted({item["clip_id"] for item in scored_windows})
+        family_penalty = candidate_family_penalty(ordered_features, reference_transform_types)
         ranked.append(
             {
                 "candidate_id": group_id,
                 "clip_id": clip_ids[0] if clip_ids else group_id,
                 "clip_ids": clip_ids,
-                "distance": round(group_distance, 6) if group_distance != float("inf") else float("inf"),
+                "distance": round(group_distance + family_penalty, 6) if group_distance != float("inf") else float("inf"),
+                "raw_distance": round(group_distance, 6) if group_distance != float("inf") else float("inf"),
                 "window_count": len(scored_windows),
                 "window_candidates": sorted(scored_windows, key=lambda item: (float(item["distance"]), item["candidate_id"])),
             }
@@ -164,6 +172,65 @@ def is_parallel_contributor_group(candidates: list[dict]) -> bool:
         if isinstance(candidate.get("source_window_entry"), dict)
     ]
     return bool(roles) and all(role.startswith("contributor-") for role in roles)
+
+
+def is_segment_sequence_group(feature_documents: list[dict]) -> bool:
+    roles = [
+        str(document.get("source_window_entry", {}).get("role", ""))
+        for document in feature_documents
+        if isinstance(document.get("source_window_entry"), dict)
+    ]
+    return len(roles) >= 2 and all(role == "segment" for role in roles)
+
+
+def candidate_family_penalty(feature_documents: list[dict], reference_transform_types: set[str]) -> float:
+    if "simple_cut" in reference_transform_types and not is_segment_sequence_group(feature_documents):
+        return 1000.0
+    if "split_screen" in reference_transform_types and not is_parallel_contributor_group(feature_documents):
+        return 1000.0
+    return 0.0
+
+
+def simple_cut_segment_sequence_distance(reference_features: dict, feature_documents: list[dict]) -> float | None:
+    reference_frames = [frame for frame in reference_features.get("features", []) if isinstance(frame, dict)]
+    if not reference_frames or len(feature_documents) < 2:
+        return None
+    weights = []
+    for document in feature_documents:
+        entry = document.get("source_window_entry") if isinstance(document.get("source_window_entry"), dict) else {}
+        source_in = entry.get("source_in")
+        source_out = entry.get("source_out")
+        try:
+            weights.append(max(1, int(source_out) - int(source_in)))
+        except (TypeError, ValueError):
+            weights.append(max(1, len([frame for frame in document.get("features", []) if isinstance(frame, dict)])))
+    reference_chunks = split_feature_frames_by_weights(reference_frames, weights)
+    distances = []
+    for chunk_frames, document in zip(reference_chunks, feature_documents, strict=False):
+        candidate_frames = [frame for frame in document.get("features", []) if isinstance(frame, dict)]
+        if not chunk_frames or not candidate_frames:
+            continue
+        candidate_document = {"features": candidate_frames, "temporal_signature": binned_temporal_signature(candidate_frames, bins=8)}
+        distance = color_distance({"features": chunk_frames, "temporal_signature": binned_temporal_signature(chunk_frames, bins=8)}, candidate_document)
+        if distance is not None:
+            distances.append(distance)
+    if not distances:
+        return None
+    return average(distances)
+
+
+def split_feature_frames_by_weights(frames: list[dict], weights: list[int]) -> list[list[dict]]:
+    total = sum(max(1, weight) for weight in weights)
+    chunks = []
+    start = 0
+    for index, weight in enumerate(weights):
+        if index == len(weights) - 1:
+            end = len(frames)
+        else:
+            end = max(start + 1, round((sum(weights[: index + 1]) / total) * len(frames)))
+        chunks.append(frames[start:end])
+        start = end
+    return chunks
 
 
 def combine_parallel_feature_documents(candidates: list[dict]) -> dict | None:
