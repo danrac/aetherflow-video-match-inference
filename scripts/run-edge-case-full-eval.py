@@ -32,9 +32,10 @@ def main(argv: list[str]) -> int:
             continue
         reference_features = load_feature_manifest(root / reference_feature_manifest)
         ground_truth = load_json(root / sample["ground_truth_path"])
-        transform_types = transform_types_from_ground_truth(ground_truth)
+        transforms = transforms_from_ground_truth(ground_truth)
+        transform_types = transform_types_from_transforms(transforms)
         expected_clip_ids = source_clip_ids_from_ground_truth(ground_truth)
-        ranked = rank_candidates(reference_features, candidate_features, transform_types)
+        ranked = rank_candidates(reference_features, candidate_features, transforms)
         expected_ranks = [index + 1 for index, candidate in enumerate(ranked) if ranked_item_matches_expected(candidate, expected_clip_ids)]
         if not expected_ranks:
             continue
@@ -87,12 +88,15 @@ def load_source_window_candidates(root: Path, dataset: dict) -> list[dict]:
     return candidates
 
 
-def rank_candidates(reference_features: dict, candidates: list[dict], reference_transform_types: set[str] | None = None) -> list[dict]:
+def rank_candidates(reference_features: dict, candidates: list[dict], reference_transforms: list[dict] | None = None) -> list[dict]:
     if any(candidate.get("candidate_group_id") for candidate in candidates):
-        return rank_candidate_groups(reference_features, candidates, reference_transform_types or set())
+        return rank_candidate_groups(reference_features, candidates, reference_transforms or [])
     ranked = []
     for candidate in candidates:
-        distance = color_distance(reference_features, candidate["features"])
+        distance = best_group_distance(
+            color_distance(reference_features, candidate["features"]),
+            spatial_transform_distance(reference_features, candidate["features"], reference_transforms or []),
+        )
         ranked.append(
             {
                 "candidate_id": candidate["candidate_id"],
@@ -103,7 +107,8 @@ def rank_candidates(reference_features: dict, candidates: list[dict], reference_
     return sorted(ranked, key=lambda item: (float(item["distance"]), item["clip_id"], item["candidate_id"]))
 
 
-def rank_candidate_groups(reference_features: dict, candidates: list[dict], reference_transform_types: set[str]) -> list[dict]:
+def rank_candidate_groups(reference_features: dict, candidates: list[dict], reference_transforms: list[dict]) -> list[dict]:
+    reference_transform_types = transform_types_from_transforms(reference_transforms)
     grouped = defaultdict(list)
     for candidate in candidates:
         grouped[str(candidate.get("candidate_group_id") or candidate["candidate_id"])].append(candidate)
@@ -136,10 +141,11 @@ def rank_candidate_groups(reference_features: dict, candidates: list[dict], refe
             if "simple_cut" in reference_transform_types and is_segment_sequence_group(ordered_features)
             else None
         )
+        spatial_distance = spatial_transform_distance(reference_features, combined_features, reference_transforms) if combined_features is not None else None
         finite_distances = [float(item["distance"]) for item in scored_windows if item["distance"] != float("inf")]
         average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
         tail_distance = tail_visual_distance(reference_features, combined_features, start_fraction=0.7) if combined_features is not None else None
-        group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance)
+        group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance, spatial_distance)
         clip_ids = sorted({item["clip_id"] for item in scored_windows})
         family_penalty = candidate_family_penalty(ordered_features, reference_transform_types)
         ranked.append(
@@ -297,6 +303,14 @@ def average_grid(grids: list) -> list[list[float]] | None:
     return averaged
 
 
+def average_grid_mean_rgb(feature_document: dict) -> list[tuple[float, float, float]] | None:
+    frames = feature_document.get("features", [])
+    grid = average_grid([frame.get("grid_mean_rgb") for frame in frames if isinstance(frame, dict)])
+    if grid is None:
+        return None
+    return [tuple(float(value) for value in cell) for cell in grid]
+
+
 def panel_layout_grid(grids: list, panel_count: int) -> list[list[float]] | None:
     usable = [grid for grid in grids if isinstance(grid, list) and len(grid) == 9]
     if len(usable) != panel_count or panel_count not in {2, 3}:
@@ -349,6 +363,133 @@ def parallel_panel_layout_distance(reference_features: dict, feature_documents: 
     if not distances:
         return None
     return average(distances)
+
+
+def spatial_transform_distance(reference_features: dict, source_features: dict, transforms: list[dict]) -> float | None:
+    distances = []
+    for transform in transforms:
+        transform_type = str(transform.get("type", ""))
+        parameters = transform.get("parameters") if isinstance(transform.get("parameters"), dict) else {}
+        if transform_type == "scale_position":
+            distance = projected_grid_distance(reference_features, source_features, scale_position_geometry(parameters))
+        elif transform_type == "letterbox":
+            distance = projected_grid_distance(reference_features, source_features, aspect_fit_geometry(parameters, mode="letterbox"))
+        elif transform_type == "crop":
+            distance = projected_grid_distance(reference_features, source_features, aspect_fit_geometry(parameters, mode="crop"))
+        else:
+            distance = None
+        if distance is not None:
+            distances.append(distance)
+    if not distances:
+        return None
+    return min(distances)
+
+
+def scale_position_geometry(parameters: dict) -> dict | None:
+    try:
+        output_width = float(parameters["output_width"])
+        output_height = float(parameters["output_height"])
+        scaled_width = float(parameters["width"])
+        scaled_height = float(parameters["height"])
+        x = float(parameters.get("x", 0.0))
+        y = float(parameters.get("y", 0.0))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if min(output_width, output_height, scaled_width, scaled_height) <= 0:
+        return None
+    return {"output_width": output_width, "output_height": output_height, "x": x, "y": y, "width": scaled_width, "height": scaled_height}
+
+
+def aspect_fit_geometry(parameters: dict, mode: str) -> dict | None:
+    try:
+        output_width = float(parameters["output_width"])
+        output_height = float(parameters["output_height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    source_ratio = parse_aspect_ratio(parameters.get("source_aspect_ratio") or parameters.get("aspect_ratio"))
+    output_ratio = output_width / output_height if output_height else None
+    if source_ratio is None or output_ratio is None or min(output_width, output_height) <= 0:
+        return None
+    if mode == "crop":
+        if source_ratio > output_ratio:
+            scaled_height = output_height
+            scaled_width = output_height * source_ratio
+        else:
+            scaled_width = output_width
+            scaled_height = output_width / source_ratio
+    else:
+        if source_ratio > output_ratio:
+            scaled_width = output_width
+            scaled_height = output_width / source_ratio
+        else:
+            scaled_height = output_height
+            scaled_width = output_height * source_ratio
+    return {
+        "output_width": output_width,
+        "output_height": output_height,
+        "x": (output_width - scaled_width) / 2.0,
+        "y": (output_height - scaled_height) / 2.0,
+        "width": scaled_width,
+        "height": scaled_height,
+    }
+
+
+def parse_aspect_ratio(value) -> float | None:
+    if value is None:
+        return None
+    text = str(value)
+    if ":" in text:
+        numerator, denominator = text.split(":", 1)
+        try:
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return None
+            return float(numerator) / denominator_value
+        except ValueError:
+            return None
+    try:
+        ratio = float(text)
+    except ValueError:
+        return None
+    return ratio if ratio > 0 else None
+
+
+def projected_grid_distance(reference_features: dict, source_features: dict, geometry: dict | None) -> float | None:
+    if geometry is None:
+        return None
+    reference_grid = average_grid_mean_rgb(reference_features)
+    source_grid = average_grid_mean_rgb(source_features)
+    if reference_grid is None or source_grid is None or len(reference_grid) != 9 or len(source_grid) != 9:
+        return None
+    projected_grid = project_source_grid(source_grid, geometry)
+    distances = [
+        sqrt(sum((reference_cell[index] - projected_cell[index]) ** 2 for index in range(3)))
+        for reference_cell, projected_cell in zip(reference_grid, projected_grid, strict=False)
+    ]
+    return average(distances) * 0.2
+
+
+def project_source_grid(source_grid: list[tuple[float, float, float]], geometry: dict) -> list[tuple[float, float, float]]:
+    output_width = geometry["output_width"]
+    output_height = geometry["output_height"]
+    x = geometry["x"]
+    y = geometry["y"]
+    width = geometry["width"]
+    height = geometry["height"]
+    projected = []
+    for row in range(3):
+        center_y = (row + 0.5) * output_height / 3.0
+        for column in range(3):
+            center_x = (column + 0.5) * output_width / 3.0
+            if center_x < x or center_x > x + width or center_y < y or center_y > y + height:
+                projected.append((0.0, 0.0, 0.0))
+                continue
+            source_x = max(0.0, min(0.999999, (center_x - x) / width))
+            source_y = max(0.0, min(0.999999, (center_y - y) / height))
+            source_column = min(2, int(source_x * 3))
+            source_row = min(2, int(source_y * 3))
+            projected.append(source_grid[source_row * 3 + source_column])
+    return projected
 
 
 def average_optional_scalar(values: list) -> float | None:
@@ -440,12 +581,20 @@ def source_clip_ids_from_ground_truth(ground_truth: dict) -> set[str]:
 
 
 def transform_types_from_ground_truth(ground_truth: dict) -> set[str]:
-    return {
-        str(transform["type"])
+    return transform_types_from_transforms(transforms_from_ground_truth(ground_truth))
+
+
+def transforms_from_ground_truth(ground_truth: dict) -> list[dict]:
+    return [
+        transform
         for segment in ground_truth.get("segments", [])
         for transform in segment.get("transforms", [])
         if transform.get("type")
-    }
+    ]
+
+
+def transform_types_from_transforms(transforms: list[dict]) -> set[str]:
+    return {str(transform["type"]) for transform in transforms if transform.get("type")}
 
 
 def average(values: list[float]) -> float:
