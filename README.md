@@ -95,6 +95,18 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
 
 When feature manifests are provided, the runtime computes a lightweight visual distance from color and optional motion statistics, then emits `feature_manifest_match` reconstruction metadata. `opencv-visual-stats-v3` manifests also contribute luma, edge-density, scene-change, and sparse optical-flow statistics. Without feature manifests, it falls back to deterministic placeholder output.
 
+Run the edge-case fixture inference smoke against the exported baseline:
+
+```bash
+PYTHONPATH=src scripts/run-edge-case-smoke.py
+```
+
+By default this consumes the v0002 250-sample fixture and writes per-case match results plus a summary to:
+
+```text
+/Volumes/FrameFusion/AetherFlow_VideoMatcherData/inference/video-match-edge-case-smoke/v0001/summary.json
+```
+
 Create a host-facing payload with timeline edit reconstruction:
 
 ```bash
