@@ -39,7 +39,8 @@ def visual_distance(reference_features: dict[str, Any], source_features: dict[st
         + scalar_delta(reference_features, source_features, "edge_density", weight=50.0)
         + scalar_delta(reference_features, source_features, "scene_change_score", weight=1.0)
         + optical_flow_delta(reference_features, source_features)
-        + motion_track_summary_delta(reference_features, source_features),
+        + motion_track_summary_delta(reference_features, source_features)
+        + appearance_embedding_delta(reference_features, source_features, weight=140.0),
         6,
     )
 
@@ -319,6 +320,51 @@ def summary_axis_delta(reference_summary: dict[str, Any], source_summary: dict[s
     if not reference_axis or not source_axis or reference_axis == "none" or source_axis == "none":
         return 0.0
     return 0.0 if reference_axis == source_axis else weight
+
+
+def appearance_embedding_delta(reference_features: dict[str, Any], source_features: dict[str, Any], weight: float) -> float:
+    reference_embedding = appearance_embedding(reference_features)
+    source_embedding = appearance_embedding(source_features)
+    if reference_embedding is None or source_embedding is None or len(reference_embedding) != len(source_embedding):
+        return 0.0
+    return average([abs(reference_embedding[index] - source_embedding[index]) for index in range(len(reference_embedding))]) * weight
+
+
+def appearance_embedding(feature_document: dict[str, Any]) -> list[float] | None:
+    cache = feature_cache(feature_document)
+    if "appearance_embedding" in cache:
+        return cache["appearance_embedding"]
+    frames = [frame for frame in feature_document.get("features", []) if isinstance(frame, dict)]
+    if not frames:
+        cache["appearance_embedding"] = None
+        return None
+    vector: list[float] = []
+    mean_rgb = average_mean_rgb(feature_document)
+    if mean_rgb is not None:
+        vector.extend([min(max(float(value) / 255.0, 0.0), 1.0) for value in mean_rgb])
+    for field, divisor in (
+        ("mean_luma", 255.0),
+        ("std_luma", 128.0),
+        ("edge_density", 1.0),
+        ("scene_change_score", 255.0),
+        ("mean_absdiff_from_previous", 255.0),
+    ):
+        value = average_scalar(feature_document, field)
+        vector.append(min(max(float(value or 0.0) / divisor, 0.0), 1.0))
+    histogram = average_histogram(feature_document, "active_hue_histogram")
+    if histogram:
+        vector.extend(min(max(float(value), 0.0), 1.0) for value in histogram)
+    grid = average_grid_mean_rgb(feature_document)
+    if grid:
+        for cell in grid:
+            vector.append(min(max(sum(float(channel) for channel in cell) / (3.0 * 255.0), 0.0), 1.0))
+    signature = temporal_signature(feature_document)
+    if signature:
+        columns = min(len(signature[0]), 8) if signature[0] else 0
+        for column in range(columns):
+            vector.append(average([float(row[column]) for row in signature if len(row) > column]))
+    cache["appearance_embedding"] = vector if vector else None
+    return cache["appearance_embedding"]
 
 
 def average(values: list[float]) -> float:
