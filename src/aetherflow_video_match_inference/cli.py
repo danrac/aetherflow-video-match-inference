@@ -28,6 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     source_windows = subcommands.add_parser("match-source-windows")
     source_windows.add_argument("--request", required=True)
     source_windows.add_argument("--output", required=True)
+    source_windows.add_argument("--schema")
+
+    validate_source_window = subcommands.add_parser("validate-source-window-request")
+    validate_source_window.add_argument("--request", required=True)
+    validate_source_window.add_argument("--schema")
 
     validate_model = subcommands.add_parser("validate-model")
     validate_model.add_argument("--model-manifest", required=True)
@@ -86,12 +91,16 @@ def main(argv: list[str] | None = None) -> int:
         print(output_path)
         return 0
     if args.command == "match-source-windows":
-        request = load_source_window_match_request(args.request)
+        request = load_source_window_match_request(args.request, schema_path=args.schema)
         result = match_source_windows(request)
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(output_path)
+        return 0
+    if args.command == "validate-source-window-request":
+        validate_source_window_request_document(args.request, args.schema)
+        print("source-window request validation ok")
         return 0
     if args.command == "validate-model":
         with Path(args.model_manifest).open("r", encoding="utf-8") as handle:
@@ -137,9 +146,9 @@ def main(argv: list[str] | None = None) -> int:
     raise AssertionError(f"Unhandled command: {args.command}")
 
 
-def load_source_window_match_request(path: str | Path) -> SourceWindowMatchRequest:
-    with Path(path).open("r", encoding="utf-8") as handle:
-        document = json.load(handle)
+def load_source_window_match_request(path: str | Path, schema_path: str | Path | None = None) -> SourceWindowMatchRequest:
+    document = load_json_object(path)
+    validate_source_window_request_document(path, schema_path, document)
     if not isinstance(document, dict):
         raise ValueError(f"Expected source-window request object at {path}")
     candidates = []
@@ -167,6 +176,93 @@ def load_source_window_match_request(path: str | Path) -> SourceWindowMatchReque
         transforms=tuple(document.get("transforms", [])),
         reranker_model_path=str(document["reranker_model_path"]) if document.get("reranker_model_path") else None,
     )
+
+
+def validate_source_window_request_document(path: str | Path, schema_path: str | Path | None = None, document: dict | None = None) -> None:
+    resolved_schema = Path(schema_path) if schema_path else default_source_window_request_schema()
+    if resolved_schema is None or not resolved_schema.exists():
+        return
+    request_document = document if document is not None else load_json_object(path)
+    schema = load_json_object(resolved_schema)
+    errors = validate_schema_subset(request_document, schema)
+    if errors:
+        raise ValueError("\n".join(errors))
+
+
+def default_source_window_request_schema() -> Path | None:
+    repo_contract_schema = Path(__file__).resolve().parents[3] / "contracts" / "schemas" / "source_window_match_request.schema.json"
+    if repo_contract_schema.exists():
+        return repo_contract_schema
+    return None
+
+
+def load_json_object(path: str | Path) -> dict:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise ValueError(f"Expected JSON object at {path}")
+    return document
+
+
+def validate_schema_subset(document, schema: dict, path: str = "$") -> list[str]:
+    errors: list[str] = []
+    expected_type = schema.get("type")
+    if expected_type and not matches_schema_type(document, expected_type):
+        return [f"{path}: expected {expected_type}, got {type(document).__name__}"]
+
+    if expected_type == "object":
+        if not isinstance(document, dict):
+            return [f"{path}: expected object"]
+        for key in schema.get("required", []):
+            if key not in document:
+                errors.append(f"{path}: missing required property {key}")
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            for key in document:
+                if key not in properties:
+                    errors.append(f"{path}: additional property {key}")
+        for key, value in document.items():
+            if key in properties:
+                errors.extend(validate_schema_subset(value, properties[key], f"{path}.{key}"))
+
+    if expected_type == "array":
+        if not isinstance(document, list):
+            return [f"{path}: expected array"]
+        min_items = schema.get("minItems")
+        if min_items is not None and len(document) < int(min_items):
+            errors.append(f"{path}: expected at least {min_items} items")
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(document):
+                errors.extend(validate_schema_subset(item, item_schema, f"{path}[{index}]"))
+
+    if isinstance(document, (int, float)) and not isinstance(document, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        exclusive_minimum = schema.get("exclusiveMinimum")
+        if minimum is not None and document < minimum:
+            errors.append(f"{path}: expected >= {minimum}")
+        if maximum is not None and document > maximum:
+            errors.append(f"{path}: expected <= {maximum}")
+        if exclusive_minimum is not None and document <= exclusive_minimum:
+            errors.append(f"{path}: expected > {exclusive_minimum}")
+    return errors
+
+
+def matches_schema_type(value, expected_type: str) -> bool:
+    if expected_type == "object":
+        return isinstance(value, dict)
+    if expected_type == "array":
+        return isinstance(value, list)
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    return True
 
 
 if __name__ == "__main__":

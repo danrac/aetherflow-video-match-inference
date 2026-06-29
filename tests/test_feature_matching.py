@@ -317,6 +317,7 @@ class FeatureMatchingTests(unittest.TestCase):
             write_json(
                 request_path,
                 {
+                    "schema_version": "0.1.0",
                     "reference_path": "/tmp/reference.mp4",
                     "model_manifest_path": str(model_manifest),
                     "reference_feature_manifest_path": str(reference_features),
@@ -342,6 +343,60 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(result["matches"][0]["source_in"], 3)
             self.assertEqual(result["matches"][0]["source_out"], 27)
             self.assertEqual(result["ranking"]["top_candidates"][0]["candidate_id"], "edit-001")
+
+    def test_cli_validates_source_window_request_schema(self) -> None:
+        schema_path = CONTRACTS_ROOT / "schemas" / "source_window_match_request.schema.json"
+        if not schema_path.exists():
+            self.skipTest("contracts checkout is not available")
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-validate-") as temp_dir:
+            root = Path(temp_dir)
+            request_path = root / "request.json"
+            write_json(
+                request_path,
+                {
+                    "schema_version": "0.1.0",
+                    "reference_path": "/tmp/reference.mp4",
+                    "model_manifest_path": "/tmp/model_manifest.json",
+                    "reference_feature_manifest_path": "/tmp/reference.features.json",
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-a",
+                            "candidate_group_id": "edit-001",
+                            "source_path": "/tmp/a.mp4",
+                            "source_clip_id": "clip-a",
+                            "feature_manifest_path": "/tmp/source.features.json",
+                            "source_in": 0,
+                            "source_out": 24,
+                        }
+                    ],
+                },
+            )
+
+            exit_code = cli_main(["validate-source-window-request", "--request", str(request_path), "--schema", str(schema_path)])
+
+            self.assertEqual(exit_code, 0)
+
+    def test_cli_rejects_invalid_source_window_request_schema(self) -> None:
+        schema_path = CONTRACTS_ROOT / "schemas" / "source_window_match_request.schema.json"
+        if not schema_path.exists():
+            self.skipTest("contracts checkout is not available")
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-invalid-") as temp_dir:
+            root = Path(temp_dir)
+            request_path = root / "request.json"
+            write_json(
+                request_path,
+                {
+                    "schema_version": "0.1.0",
+                    "reference_path": "/tmp/reference.mp4",
+                    "model_manifest_path": "/tmp/model_manifest.json",
+                    "candidates": [],
+                },
+            )
+
+            with self.assertRaises(ValueError) as context:
+                cli_main(["validate-source-window-request", "--request", str(request_path), "--schema", str(schema_path)])
+
+            self.assertIn("reference_feature_manifest_path", str(context.exception))
 
     def test_source_window_match_exports_to_host_payload_and_cep_json(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-host-") as temp_dir:
