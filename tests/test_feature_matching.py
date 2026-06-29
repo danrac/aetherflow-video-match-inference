@@ -15,6 +15,7 @@ from aetherflow_video_match_inference.interchange import export_after_effects_ex
 from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
+FULL_EVAL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-edge-case-full-eval.py"
 
 
 class FeatureMatchingTests(unittest.TestCase):
@@ -164,6 +165,26 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertEqual(visual_distance(reference_with_flow, source_with_opposite_flow), 0.0)
         self.assertGreater(visual_distance(reference, source_reversed, allow_temporal_reverse=False), 0.0)
 
+    def test_full_eval_reranker_uses_temporal_hybrid_routing(self) -> None:
+        module = load_full_eval_script()
+        model = {
+            "weights": [10.0 for _ in module.FEATURE_NAMES],
+            "bias": 0.0,
+            "routing": {
+                "baseline_protected_transform_types": ["scale_position"],
+                "learned_reranker_applies_to": ["reverse", "simple_cut"],
+            },
+        }
+        components = {name: 1.0 for name in module.FEATURE_NAMES}
+        components["family_penalty"] = 0.0
+        components["window_count"] = 1.0
+
+        simple_cut_score = module.reranker_distance(components, {"simple_cut"}, 123.0, model)
+        scale_score = module.reranker_distance(components, {"scale_position"}, 123.0, model)
+
+        self.assertNotEqual(simple_cut_score, 123.0)
+        self.assertEqual(scale_score, 123.0)
+
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
             model_manifest = write_model_manifest(Path(temp_dir))
@@ -305,6 +326,15 @@ def write_feature_manifest(
 
 def write_json(path: Path, document: dict) -> None:
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load_full_eval_script():
+    spec = importlib.util.spec_from_file_location("aetherflow_full_eval_test_module", FULL_EVAL_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load full eval script")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def identity_onnx_model_bytes() -> bytes:

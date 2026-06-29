@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
-from math import sqrt
+from math import isfinite, log1p, sqrt
 import os
 from pathlib import Path
 import sys
@@ -16,11 +16,25 @@ from aetherflow_video_match_inference.features import color_distance, load_featu
 DATA_ROOT = Path(os.environ.get("AETHERFLOW_VIDEO_MATCH_DATA_ROOT", "/Volumes/FrameFusion/AetherFlow_VideoMatcherData"))
 DEFAULT_DATASET = DATA_ROOT / "datasets" / "video-match-edge-case-fixture" / "v0003" / "dataset_manifest.json"
 DEFAULT_OUTPUT = DATA_ROOT / "inference" / "video-match-edge-case-full-eval" / "v0003-hist" / "report.json"
+FEATURE_NAMES = [
+    "combined_visual",
+    "average_window",
+    "tail_visual",
+    "parallel_visual",
+    "panel_layout",
+    "segment_sequence",
+    "spatial_transform",
+    "pip_overlay",
+    "family_penalty",
+    "window_count",
+]
+MISSING_DISTANCE = 1000.0
 
 
 def main(argv: list[str]) -> int:
     dataset_manifest = Path(argv[1]) if len(argv) > 1 else DEFAULT_DATASET
     output_path = Path(argv[2]) if len(argv) > 2 else DEFAULT_OUTPUT
+    reranker_model = load_reranker_model(argv[3]) if len(argv) > 3 else None
     root = dataset_manifest.parent
     dataset = load_json(dataset_manifest)
     candidate_features = load_source_window_candidates(root, dataset)
@@ -36,7 +50,7 @@ def main(argv: list[str]) -> int:
         transforms = transforms_from_ground_truth(ground_truth)
         transform_types = transform_types_from_transforms(transforms)
         expected_clip_ids = source_clip_ids_from_ground_truth(ground_truth)
-        ranked = rank_prepared_candidate_groups(reference_features, candidate_groups, transforms)
+        ranked = rank_prepared_candidate_groups(reference_features, candidate_groups, transforms, reranker_model)
         expected_ranks = [index + 1 for index, candidate in enumerate(ranked) if ranked_item_matches_expected(candidate, expected_clip_ids)]
         if not expected_ranks:
             continue
@@ -61,6 +75,7 @@ def main(argv: list[str]) -> int:
     report = {
         "dataset_manifest": str(dataset_manifest),
         "candidate_count": len(candidate_features),
+        "reranker_model": reranker_model_summary(reranker_model),
         "metrics": metrics(results),
         "breakdown_by_transform": breakdown_by_transform(results),
         "results": results,
@@ -89,9 +104,9 @@ def load_source_window_candidates(root: Path, dataset: dict) -> list[dict]:
     return candidates
 
 
-def rank_candidates(reference_features: dict, candidates: list[dict], reference_transforms: list[dict] | None = None) -> list[dict]:
+def rank_candidates(reference_features: dict, candidates: list[dict], reference_transforms: list[dict] | None = None, reranker_model: dict | None = None) -> list[dict]:
     if any(candidate.get("candidate_group_id") for candidate in candidates):
-        return rank_candidate_groups(reference_features, candidates, reference_transforms or [])
+        return rank_candidate_groups(reference_features, candidates, reference_transforms or [], reranker_model)
     ranked = []
     for candidate in candidates:
         distance = best_group_distance(
@@ -108,8 +123,8 @@ def rank_candidates(reference_features: dict, candidates: list[dict], reference_
     return sorted(ranked, key=lambda item: (float(item["distance"]), item["clip_id"], item["candidate_id"]))
 
 
-def rank_candidate_groups(reference_features: dict, candidates: list[dict], reference_transforms: list[dict]) -> list[dict]:
-    return rank_prepared_candidate_groups(reference_features, prepare_candidate_groups(candidates), reference_transforms)
+def rank_candidate_groups(reference_features: dict, candidates: list[dict], reference_transforms: list[dict], reranker_model: dict | None = None) -> list[dict]:
+    return rank_prepared_candidate_groups(reference_features, prepare_candidate_groups(candidates), reference_transforms, reranker_model)
 
 
 def prepare_candidate_groups(candidates: list[dict]) -> list[dict]:
@@ -138,7 +153,7 @@ def prepare_candidate_groups(candidates: list[dict]) -> list[dict]:
     return prepared_groups
 
 
-def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: list[dict], reference_transforms: list[dict]) -> list[dict]:
+def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: list[dict], reference_transforms: list[dict], reranker_model: dict | None = None) -> list[dict]:
     reference_transform_types = transform_types_from_transforms(reference_transforms)
     is_reverse_reference = "reverse" in reference_transform_types
     ranked = []
@@ -186,15 +201,28 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
         finite_distances = [float(item["distance"]) for item in scored_windows if item["distance"] != float("inf")]
         average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
         tail_distance = tail_visual_distance(reference_features, scoring_combined_features, start_fraction=0.7, allow_temporal_reverse=not is_reverse_reference) if scoring_combined_features is not None else None
+        components = {
+            "combined_visual": combined_distance,
+            "average_window": average_window_distance,
+            "tail_visual": tail_distance,
+            "parallel_visual": parallel_distance,
+            "panel_layout": panel_layout_distance,
+            "segment_sequence": segment_sequence_distance,
+            "spatial_transform": spatial_distance,
+            "pip_overlay": pip_overlay_distance,
+            "family_penalty": candidate_family_penalty(ordered_features, reference_transform_types) + split_panel_count_penalty,
+            "window_count": float(len(scored_windows)),
+        }
         group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance, spatial_distance, pip_overlay_distance)
         clip_ids = group["clip_ids"]
-        family_penalty = candidate_family_penalty(ordered_features, reference_transform_types) + split_panel_count_penalty
+        baseline_distance = group_distance + float(components["family_penalty"]) if group_distance != float("inf") else float("inf")
+        score_distance = reranker_distance(components, reference_transform_types, baseline_distance, reranker_model)
         ranked.append(
             {
                 "candidate_id": group_id,
                 "clip_id": clip_ids[0] if clip_ids else group_id,
                 "clip_ids": clip_ids,
-                "distance": round(group_distance + family_penalty, 6) if group_distance != float("inf") else float("inf"),
+                "distance": round(score_distance, 6) if score_distance != float("inf") else float("inf"),
                 "raw_distance": round(group_distance, 6) if group_distance != float("inf") else float("inf"),
                 "window_count": len(scored_windows),
                 "window_candidates": sorted(scored_windows, key=lambda item: (float(item["distance"]), item["candidate_id"])),
@@ -949,6 +977,54 @@ def average(values: list[float]) -> float:
     if not values:
         return 0.0
     return round(sum(values) / len(values), 6)
+
+
+def load_reranker_model(path: str | Path) -> dict:
+    model = load_json(path)
+    weights = model.get("weights")
+    if not isinstance(weights, list) or len(weights) != len(FEATURE_NAMES):
+        raise ValueError(f"reranker model {path} does not contain {len(FEATURE_NAMES)} weights")
+    model["weights"] = [float(value) for value in weights]
+    model["bias"] = float(model.get("bias", 0.0))
+    return model
+
+
+def reranker_model_summary(model: dict | None) -> dict | None:
+    if model is None:
+        return None
+    return {
+        "model_id": model.get("model_id"),
+        "model_version": model.get("model_version"),
+        "routing": model.get("routing"),
+    }
+
+
+def reranker_distance(components: dict, transform_types: set[str], baseline_distance: float, model: dict | None) -> float:
+    if model is None or not use_learned_reranker(transform_types, model):
+        return baseline_distance
+    features = normalize_components(components)
+    return sum(float(model["weights"][index]) * features[index] for index in range(len(FEATURE_NAMES))) + float(model.get("bias", 0.0))
+
+
+def use_learned_reranker(transform_types: set[str], model: dict) -> bool:
+    routing = model.get("routing") if isinstance(model.get("routing"), dict) else {}
+    protected = set(routing.get("baseline_protected_transform_types") or ["crop", "letterbox", "picture_in_picture", "pillarbox", "scale_position"])
+    return not bool(transform_types & protected)
+
+
+def normalize_components(components: dict) -> list[float]:
+    features = []
+    for name in FEATURE_NAMES:
+        value = components.get(name)
+        if value is None or not isfinite(float(value)):
+            value = MISSING_DISTANCE
+        if name == "family_penalty":
+            features.append(min(float(value), 1000.0) / 1000.0)
+        elif name == "window_count":
+            features.append(min(float(value), 8.0) / 8.0)
+        else:
+            features.append(log1p(max(0.0, float(value))) / log1p(1000.0))
+    return features
 
 
 def load_json(path: str | Path) -> dict:
