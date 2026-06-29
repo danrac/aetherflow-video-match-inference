@@ -50,13 +50,13 @@ def media_window_rescore(reference_path: str, reference_features: dict[str, Any]
     source_fps = float(candidate["features"].get("fps", reference_fps) or reference_fps)
     source_duration = source_out - source_in
     max_start = max(source_in, source_out - reference_duration)
-    rel_frames = sample_relative_frames(reference_duration)
-    candidate_starts = candidate_start_grid(source_in, max_start, rel_frames, candidate["features"])
+    identity_rel_frames = sample_relative_frames(reference_duration)
+    candidate_starts = candidate_start_grid(source_in, max_start, identity_rel_frames, candidate["features"])
     if not candidate_starts:
         return None
 
     reference_arrays = []
-    for rel_frame in rel_frames:
+    for rel_frame in identity_rel_frames:
         frame = read_video_frame(reference_path, reference_start + rel_frame, reference_fps)
         if frame is None:
             return None
@@ -67,7 +67,7 @@ def media_window_rescore(reference_path: str, reference_features: dict[str, Any]
         distance = score_candidate_start(
             candidate["source_path"],
             start_frame,
-            rel_frames,
+            identity_rel_frames,
             source_fps,
             reference_arrays,
             np,
@@ -122,6 +122,92 @@ def candidate_start_grid(source_in: int, max_start: int, rel_frames: list[int], 
                     seen.add(value)
                     ordered.append(value)
     return ordered[:16]
+
+
+def refine_boundary_start(
+    reference_path: str,
+    reference_features: dict[str, Any],
+    candidate: dict[str, Any],
+    source_in: int,
+    max_start: int,
+    reference_start: int,
+    reference_duration: int,
+    reference_fps: float,
+    source_fps: float,
+    np: Any,
+    Image: Any,
+    ImageOps: Any,
+    baseline_start: int | None = None,
+) -> dict[str, Any] | None:
+    frame = read_video_frame(reference_path, reference_start, reference_fps)
+    if frame is None:
+        return None
+    reference_array = np.asarray(ImageOps.fit(frame.convert("RGB"), COMPARE_SIZE, method=Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+    starts = boundary_start_grid(source_in, max_start, reference_start, reference_features, candidate["features"])
+    baseline_distance = None
+    if baseline_start is not None and source_in <= baseline_start <= max_start:
+        baseline_distance = score_boundary_start(candidate["source_path"], baseline_start, source_fps, reference_array, np, Image, ImageOps)
+    best = None
+    for start_frame in starts:
+        distance = score_boundary_start(candidate["source_path"], start_frame, source_fps, reference_array, np, Image, ImageOps)
+        if distance is None:
+            continue
+        if best is None or distance < best["distance"]:
+            best = {"distance": distance, "source_in": start_frame}
+    if best is not None:
+        best["baseline_distance"] = baseline_distance
+    return best
+
+
+def score_boundary_start(source_path: str, start_frame: int, fps: float, reference_array: Any, np: Any, Image: Any, ImageOps: Any) -> float | None:
+    source_frame = read_video_frame(source_path, start_frame, fps)
+    if source_frame is None:
+        return None
+    source_array = center_vertical_crop_array(source_frame, np, Image, ImageOps)
+    keypoint_distance = structural_keypoint_distance(reference_array, source_array, np)
+    if keypoint_distance is not None:
+        return keypoint_distance
+    return frame_distance(reference_array, source_array, np)
+
+
+def center_vertical_crop_array(source_frame: Any, np: Any, Image: Any, ImageOps: Any) -> Any:
+    source_rgb = source_frame.convert("RGB")
+    width, height = source_rgb.size
+    crop_width = min(width, max(1, int(round(height * 9.0 / 16.0))))
+    left = int(round((width - crop_width) * 0.5))
+    crop = source_rgb.crop((left, 0, left + crop_width, height))
+    return np.asarray(ImageOps.fit(crop, COMPARE_SIZE, method=Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+
+
+def boundary_start_grid(source_in: int, max_start: int, reference_start: int, reference_features: dict[str, Any], feature_document: dict[str, Any]) -> list[int]:
+    starts: list[int] = []
+    seen: set[int] = set()
+
+    def add(value: int) -> None:
+        if source_in <= value <= max_start and value not in seen:
+            seen.add(value)
+            starts.append(value)
+
+    reference_rel_frames = [
+        int(frame.get("frame_index")) - reference_start
+        for frame in reference_features.get("features", [])
+        if isinstance(frame, dict) and frame.get("frame_index") is not None
+    ]
+    if reference_rel_frames:
+        reference_rel_frames = sorted(set([reference_rel_frames[0], reference_rel_frames[-1]]))
+    sampled_frames = [
+        int(frame.get("frame_index"))
+        for frame in feature_document.get("features", [])
+        if isinstance(frame, dict) and frame.get("frame_index") is not None
+    ]
+    for start in candidate_start_grid(source_in, max_start, [0], feature_document)[:8]:
+        add(start)
+    for sampled_frame in sampled_frames:
+        for rel_frame in reference_rel_frames:
+            center = sampled_frame - rel_frame
+            for delta in (0, -5, 5):
+                add(center + delta)
+    return starts[:48]
 
 
 def score_candidate_start(source_path: str, start_frame: int, rel_frames: list[int], fps: float, reference_arrays: list[Any], np: Any, ImageOps: Any) -> float | None:

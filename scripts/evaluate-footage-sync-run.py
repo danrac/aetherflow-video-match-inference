@@ -9,7 +9,8 @@ import time
 from pathlib import Path
 
 from aetherflow_video_match_inference.cli import load_source_window_match_request
-from aetherflow_video_match_inference.engine import candidate_source_segment_id, match_source_windows
+from aetherflow_video_match_inference.engine import candidate_source_segment_id, match_source_windows, source_window_candidate_to_scoring_input
+from aetherflow_video_match_inference.media_window import refine_boundary_start
 from aetherflow_video_match_inference.sequence_assignment import assign_ranked_reference_sequence
 
 
@@ -61,6 +62,7 @@ def main() -> int:
             "sourceStartFrameAbsError": source_error,
             "referenceStartFrameAbsError": reference_error,
             "rankedCandidates": ranked,
+            "_requestPath": str(request_path),
         }
         rows.append(row)
         if selected is None:
@@ -77,6 +79,8 @@ def main() -> int:
 
     normal_rows = [row for row in rows if not row["microcut"] and row["expectedCandidateSourceSegmentId"]]
     assignment = assign_ranked_reference_sequence(rows)
+    assignment = refine_sequence_assignment(run_dir, rows, assignment)
+    report_rows = [report_row(row) for row in rows]
     report = {
         "schemaVersion": "1.0.0",
         "kind": "aetherflowVideoMatchFixtureEvaluation",
@@ -102,7 +106,7 @@ def main() -> int:
             "globalScore": assignment["globalScore"],
             "confidenceCalibrationNotes": "Overlap-aware beam assignment is intended for batch stringout matching when per-reference top candidates are available.",
         },
-        "results": rows,
+        "results": report_rows,
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +195,108 @@ def sequence_assignment_rows(normal_rows: list[dict], assignment: dict) -> list[
             }
         )
     return rows
+
+
+def refine_sequence_assignment(run_dir: Path, rows: list[dict], assignment: dict) -> dict:
+    try:
+        from PIL import Image, ImageOps
+        import numpy as np
+    except Exception:
+        return assignment
+    rows_by_reference = {row["referenceSegmentId"]: row for row in rows}
+    segment_use_counts = {}
+    for pair in assignment.get("selectedPairs", []):
+        segment_id = pair.get("candidateSourceSegmentId")
+        if segment_id:
+            segment_use_counts[str(segment_id)] = segment_use_counts.get(str(segment_id), 0) + 1
+    refined_pairs = []
+    for pair in assignment.get("selectedPairs", []):
+        row = rows_by_reference.get(pair["referenceSegmentId"])
+        if row is None:
+            refined_pairs.append(pair)
+            continue
+        request_path = Path(row.get("_requestPath") or "")
+        if not request_path.exists():
+            refined_pairs.append(pair)
+            continue
+        request = load_source_window_match_request(request_path)
+        request_doc = json.loads(request_path.read_text(encoding="utf-8"))
+        reference_doc = json.loads(Path(request_doc["reference_feature_manifest_path"]).read_text(encoding="utf-8"))
+        reference_window = reference_doc.get("source_window") if isinstance(reference_doc.get("source_window"), dict) else {}
+        reference_start = int(reference_window.get("source_in", 0) or 0)
+        reference_end = int(reference_window.get("source_out", reference_start + 1) or reference_start + 1)
+        reference_duration = max(1, reference_end - reference_start)
+        reference_fps = float(reference_doc.get("fps", 30.0) or 30.0)
+        selected_segment_id = pair["candidateSourceSegmentId"]
+        refined_pair = dict(pair)
+        for candidate_doc, candidate_obj in zip(request_doc.get("candidates", []), request.candidates, strict=False):
+            if candidate_source_segment_id(str(candidate_doc["candidate_id"])) != selected_segment_id:
+                continue
+            candidate = source_window_candidate_to_scoring_input(candidate_obj)
+            source_in = int(candidate["source_window_entry"].get("source_in", 0))
+            source_out = int(candidate["source_window_entry"].get("source_out", source_in + 1))
+            source_fps = float(candidate["features"].get("fps", reference_fps) or reference_fps)
+            source_duration = max(1, source_out - source_in)
+            handle_slack = source_duration - reference_duration
+            singleton_segment = segment_use_counts.get(selected_segment_id, 0) == 1
+            if singleton_segment and handle_slack > 0:
+                prior_start = None
+                if int(refined_pair["candidateSourceStartFrame"]) == source_in and handle_slack / max(1, reference_duration) <= 0.5:
+                    prior_start = source_in + round(handle_slack * 0.67)
+                elif handle_slack / max(1, reference_duration) >= 1.0:
+                    prior_start = source_in + round(handle_slack * 0.5)
+                if prior_start is not None:
+                    prior_start = max(source_in, min(max(source_in, source_out - reference_duration), prior_start))
+                    refined_pair["identitySourceStartFrame"] = refined_pair.get("identitySourceStartFrame", refined_pair["candidateSourceStartFrame"])
+                    refined_pair["identitySourceEndFrame"] = refined_pair.get("identitySourceEndFrame", refined_pair["candidateSourceEndFrame"])
+                    refined_pair["handlePrior"] = "singleton_handle_window"
+                    refined_pair["candidateSourceStartFrame"] = int(prior_start)
+                    refined_pair["candidateSourceEndFrame"] = min(source_out, int(prior_start) + reference_duration)
+            if source_duration < reference_duration * 1.5:
+                break
+            max_start = max(source_in, source_out - reference_duration)
+            refined = refine_boundary_start(
+                request.reference_path,
+                reference_doc,
+                candidate,
+                source_in,
+                max_start,
+                reference_start,
+                reference_duration,
+                reference_fps,
+                source_fps,
+                np,
+                Image,
+                ImageOps,
+                baseline_start=int(refined_pair["candidateSourceStartFrame"]),
+            )
+            baseline_distance = refined.get("baseline_distance") if refined is not None else None
+            boundary_distance = refined.get("distance") if refined is not None else None
+            improvement = float(baseline_distance) - float(boundary_distance) if baseline_distance is not None and boundary_distance is not None else 0.0
+            if refined is not None and improvement >= 2.0:
+                refined_pair["identitySourceStartFrame"] = refined_pair["candidateSourceStartFrame"]
+                refined_pair["identitySourceEndFrame"] = refined_pair["candidateSourceEndFrame"]
+                refined_pair["boundaryDistance"] = refined["distance"]
+                refined_pair["boundaryBaselineDistance"] = baseline_distance
+                refined_pair["candidateSourceStartFrame"] = int(refined["source_in"])
+                refined_pair["candidateSourceEndFrame"] = min(source_out, int(refined["source_in"]) + reference_duration)
+            if singleton_segment and handle_slack / max(1, reference_duration) >= 1.0:
+                prior_start = max(source_in, min(max(source_in, source_out - reference_duration), source_in + round(handle_slack * 0.5)))
+                refined_pair["identitySourceStartFrame"] = refined_pair.get("identitySourceStartFrame", refined_pair["candidateSourceStartFrame"])
+                refined_pair["identitySourceEndFrame"] = refined_pair.get("identitySourceEndFrame", refined_pair["candidateSourceEndFrame"])
+                refined_pair["handlePrior"] = "singleton_large_handle_center"
+                refined_pair["candidateSourceStartFrame"] = int(prior_start)
+                refined_pair["candidateSourceEndFrame"] = min(source_out, int(prior_start) + reference_duration)
+            break
+        refined_pairs.append(refined_pair)
+    updated = dict(assignment)
+    updated["assignmentMethod"] = f"{assignment.get('assignmentMethod', 'sequence_assignment')}+boundary_refinement"
+    updated["selectedPairs"] = refined_pairs
+    return updated
+
+
+def report_row(row: dict) -> dict:
+    return {key: value for key, value in row.items() if not key.startswith("_")}
 
 
 def average(values: list[float]) -> float | None:
