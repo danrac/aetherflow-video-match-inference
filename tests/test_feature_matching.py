@@ -423,9 +423,11 @@ class FeatureMatchingTests(unittest.TestCase):
             )
             request_path = root / "request.json"
             output_path = root / "match.json"
+            profile_path = root / "profile.json"
+            write_json(profile_path, {"model_manifest": str(model_manifest)})
             builder = load_request_builder_script()
 
-            exit_code = builder.main(["--dataset-manifest", str(manifest), "--sample-id", "sample-a", "--model-manifest", str(model_manifest), "--output", str(request_path)])
+            exit_code = builder.main(["--dataset-manifest", str(manifest), "--sample-id", "sample-a", "--profile", str(profile_path), "--output", str(request_path)])
             cli_exit_code = cli_main(["match-source-windows", "--request", str(request_path), "--output", str(output_path)])
             result = json.loads(output_path.read_text(encoding="utf-8"))
 
