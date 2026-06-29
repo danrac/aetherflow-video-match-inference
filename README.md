@@ -38,6 +38,12 @@ The runtime API should stay small and stable:
 match(reference_path, source_paths, model_manifest_path) -> MatchResult
 ```
 
+For production source-window matching, use the explicit grouped request path:
+
+```python
+match_source_windows(SourceWindowMatchRequest(...)) -> MatchResult
+```
+
 Host integrations should adapt this result to AetherFlow, Premiere Pro, or After Effects rather than changing the core inference output.
 
 ## Storage Root
@@ -94,6 +100,69 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match \
 ```
 
 When feature manifests are provided, the runtime computes a lightweight visual distance from color and optional motion statistics, then emits `feature_manifest_match` reconstruction metadata. `opencv-visual-stats-v5` manifests also contribute luma, edge-density, scene-change, sparse optical-flow, and normalized motion-track statistics. Without feature manifests, it falls back to deterministic placeholder output.
+
+## Source-Window Matching
+
+Validate a grouped source-window request:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli validate-source-window-request \
+  --request /path/to/request.json \
+  --schema ../contracts/schemas/source_window_match_request.schema.json
+```
+
+Run production source-window matching from a request JSON:
+
+```bash
+PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match-source-windows \
+  --request /path/to/request.json \
+  --output /path/to/match_result.json
+```
+
+Build a source-window request from a dataset sample and an inference profile:
+
+```bash
+PYTHONPATH=src python3 scripts/build-source-window-match-request.py \
+  --profile configs/public-source-generalization-v0002.example.json \
+  --dataset-manifest "$AETHERFLOW_VIDEO_MATCH_DATA_ROOT/datasets/public-source-generalization/v0002/dataset_manifest.json" \
+  --sample-id reverse-48f-0001-gsfc-20140421-earthorbit-m11525-mobile-fba6c3e2f025 \
+  --output /path/to/request.json
+```
+
+Run the full source-window smoke chain from a profile:
+
+```bash
+PYTHONPATH=src python3 scripts/run-source-window-profile-smoke.py \
+  --profile configs/public-source-generalization-v0002.example.json \
+  --dataset-manifest "$AETHERFLOW_VIDEO_MATCH_DATA_ROOT/datasets/public-source-generalization/v0002/dataset_manifest.json" \
+  --sample-id reverse-48f-0001-gsfc-20140421-earthorbit-m11525-mobile-fba6c3e2f025 \
+  --output-dir /path/to/smoke-output \
+  --schema ../contracts/schemas/source_window_match_request.schema.json
+```
+
+Run a transform-family smoke grid:
+
+```bash
+PYTHONPATH=src python3 scripts/run-source-window-profile-smoke-grid.py \
+  --profile configs/public-source-generalization-v0002.example.json \
+  --dataset-manifest "$AETHERFLOW_VIDEO_MATCH_DATA_ROOT/datasets/public-source-generalization/v0002/dataset_manifest.json" \
+  --output-dir /path/to/smoke-grid \
+  --schema ../contracts/schemas/source_window_match_request.schema.json \
+  --transform reverse \
+  --transform simple_cut \
+  --transform scale_position \
+  --transform picture_in_picture \
+  --transform crop \
+  --transform letterbox
+```
+
+Run cached profile evaluation:
+
+```bash
+PYTHONPATH=src python3 scripts/run-profile-cached-eval.py \
+  --profile configs/public-source-generalization-v0002.example.json \
+  --output /path/to/report.json
+```
 
 Run the edge-case fixture inference smoke against the exported baseline:
 
