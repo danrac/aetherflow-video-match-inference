@@ -1009,7 +1009,8 @@ def reranker_distance(components: dict, transform_types: set[str], baseline_dist
 def use_learned_reranker(transform_types: set[str], model: dict) -> bool:
     routing = model.get("routing") if isinstance(model.get("routing"), dict) else {}
     protected = set(routing.get("baseline_protected_transform_types") or ["crop", "letterbox", "picture_in_picture", "pillarbox", "scale_position"])
-    return not bool(transform_types & protected)
+    learned = set(routing.get("learned_reranker_applies_to") or ["reverse", "simple_cut"])
+    return bool(transform_types & learned) and not bool(transform_types & protected)
 
 
 def normalize_components(components: dict) -> list[float]:

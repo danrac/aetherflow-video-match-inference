@@ -181,9 +181,11 @@ class FeatureMatchingTests(unittest.TestCase):
 
         simple_cut_score = module.reranker_distance(components, {"simple_cut"}, 123.0, model)
         scale_score = module.reranker_distance(components, {"scale_position"}, 123.0, model)
+        split_screen_score = module.reranker_distance(components, {"split_screen"}, 123.0, model)
 
         self.assertNotEqual(simple_cut_score, 123.0)
         self.assertEqual(scale_score, 123.0)
+        self.assertEqual(split_screen_score, 123.0)
 
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
