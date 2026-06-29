@@ -178,16 +178,16 @@ def temporal_signature_row(frame: dict[str, Any]) -> list[float]:
     flow = frame.get("optical_flow") if isinstance(frame.get("optical_flow"), dict) else {}
     normalized_magnitude = flow.get("mean_magnitude_normalized")
     if normalized_magnitude is None:
-        normalized_magnitude = float(flow.get("mean_magnitude") or 0.0) / 255.0
+        normalized_magnitude = normalize_unit(float(flow.get("mean_magnitude") or 0.0), 255.0)
     return [
-        float(frame.get("mean_luma") or 0.0) / 255.0,
-        float(frame.get("std_luma") or 0.0) / 128.0,
-        float(frame.get("edge_density") or 0.0),
-        float(frame.get("mean_absdiff_from_previous") or 0.0) / 255.0,
-        float(normalized_magnitude or 0.0),
-        float(active_rgb[0]) / 255.0,
-        float(active_rgb[1]) / 255.0,
-        float(active_rgb[2]) / 255.0,
+        normalize_unit(float(frame.get("mean_luma") or 0.0), 255.0),
+        normalize_unit(float(frame.get("std_luma") or 0.0), 128.0),
+        min(max(float(frame.get("edge_density") or 0.0), 0.0), 1.0),
+        normalize_unit(float(frame.get("mean_absdiff_from_previous") or 0.0), 255.0),
+        min(max(float(normalized_magnitude or 0.0), 0.0), 1.0),
+        normalize_unit(float(active_rgb[0]), 255.0),
+        normalize_unit(float(active_rgb[1]), 255.0),
+        normalize_unit(float(active_rgb[2]), 255.0),
     ]
 
 
@@ -341,7 +341,7 @@ def appearance_embedding(feature_document: dict[str, Any]) -> list[float] | None
     vector: list[float] = []
     mean_rgb = average_mean_rgb(feature_document)
     if mean_rgb is not None:
-        vector.extend([min(max(float(value) / 255.0, 0.0), 1.0) for value in mean_rgb])
+        vector.extend([normalize_unit(float(value), 255.0) for value in mean_rgb])
     for field, divisor in (
         ("mean_luma", 255.0),
         ("std_luma", 128.0),
@@ -350,14 +350,14 @@ def appearance_embedding(feature_document: dict[str, Any]) -> list[float] | None
         ("mean_absdiff_from_previous", 255.0),
     ):
         value = average_scalar(feature_document, field)
-        vector.append(min(max(float(value or 0.0) / divisor, 0.0), 1.0))
+        vector.append(normalize_unit(float(value or 0.0), divisor))
     histogram = average_histogram(feature_document, "active_hue_histogram")
     if histogram:
         vector.extend(min(max(float(value), 0.0), 1.0) for value in histogram)
     grid = average_grid_mean_rgb(feature_document)
     if grid:
         for cell in grid:
-            vector.append(min(max(sum(float(channel) for channel in cell) / (3.0 * 255.0), 0.0), 1.0))
+            vector.append(normalize_unit(sum(float(channel) for channel in cell) / 3.0, 255.0))
     signature = temporal_signature(feature_document)
     if signature:
         columns = min(len(signature[0]), 8) if signature[0] else 0
@@ -365,6 +365,12 @@ def appearance_embedding(feature_document: dict[str, Any]) -> list[float] | None
             vector.append(average([float(row[column]) for row in signature if len(row) > column]))
     cache["appearance_embedding"] = vector if vector else None
     return cache["appearance_embedding"]
+
+
+def normalize_unit(value: float, divisor: float) -> float:
+    if value <= 1.0:
+        return min(max(value, 0.0), 1.0)
+    return min(max(value / divisor, 0.0), 1.0)
 
 
 def average(values: list[float]) -> float:

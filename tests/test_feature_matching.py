@@ -26,6 +26,43 @@ PROFILE_CACHED_EVAL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "
 
 
 class FeatureMatchingTests(unittest.TestCase):
+    def test_visual_distance_preserves_unit_scaled_feature_differences(self) -> None:
+        reference = {
+            "features": [
+                {
+                    "mean_rgb": [0.2, 0.2, 0.2],
+                    "active_mean_rgb": [0.2, 0.2, 0.2],
+                    "mean_luma": 0.2,
+                    "edge_density": 0.1,
+                    "mean_absdiff_from_previous": 0.1,
+                }
+            ]
+        }
+        similar = {
+            "features": [
+                {
+                    "mean_rgb": [0.21, 0.21, 0.21],
+                    "active_mean_rgb": [0.21, 0.21, 0.21],
+                    "mean_luma": 0.21,
+                    "edge_density": 0.1,
+                    "mean_absdiff_from_previous": 0.1,
+                }
+            ]
+        }
+        different = {
+            "features": [
+                {
+                    "mean_rgb": [0.8, 0.8, 0.8],
+                    "active_mean_rgb": [0.8, 0.8, 0.8],
+                    "mean_luma": 0.8,
+                    "edge_density": 0.6,
+                    "mean_absdiff_from_previous": 0.4,
+                }
+            ]
+        }
+
+        self.assertLess(visual_distance(reference, similar), visual_distance(reference, different))
+
     def test_feature_manifest_match_uses_feature_confidence(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-features-") as temp_dir:
             root = Path(temp_dir)
@@ -401,6 +438,10 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(result["matches"][0]["source_in"], 3)
             self.assertEqual(result["matches"][0]["source_out"], 27)
             self.assertEqual(result["ranking"]["top_candidates"][0]["candidate_id"], "edit-001")
+            self.assertEqual(result["diagnostics"]["rankedCandidates"][0]["referenceSegmentId"], "reference.features")
+            self.assertEqual(result["diagnostics"]["rankedCandidates"][0]["candidateSourceSegmentId"], "edit-001")
+            self.assertTrue(result["diagnostics"]["rankedCandidates"][0]["selected"])
+            self.assertEqual(result["diagnostics"]["globalAssignment"]["assignmentMethod"], "per_reference_ranking")
 
     def test_cli_validates_source_window_request_schema(self) -> None:
         schema_path = CONTRACTS_ROOT / "schemas" / "source_window_match_request.schema.json"

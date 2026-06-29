@@ -119,6 +119,8 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
                 {
                     "candidate_id": candidate["candidate_id"],
                     "clip_id": candidate["clip_id"],
+                    "source_in": int(candidate["source_window_entry"].get("source_in", 0)),
+                    "source_out": int(candidate["source_window_entry"].get("source_out", 0)),
                     "distance": distance if distance is not None else float("inf"),
                 }
             )

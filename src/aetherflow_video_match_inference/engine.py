@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .features import color_distance, confidence_from_distance, load_feature_manifest
+from .media_window import media_window_rescore
 from .reranker import load_reranker_model, rank_candidates, reranker_model_summary
 
 
@@ -78,6 +79,7 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
     reranker_model = load_reranker_model(request.reranker_model_path) if request.reranker_model_path else None
     candidates = [source_window_candidate_to_scoring_input(candidate) for candidate in request.candidates]
     ranked = rank_candidates(reference_features, candidates, list(request.transforms), reranker_model)
+    ranked = rescore_ranked_source_windows_with_media(request, reference_features, candidates, ranked)
     if not ranked:
         return source_window_result(request, model_manifest, reference_features, reranker_model, [], [])
 
@@ -90,6 +92,52 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
     selected_candidates.sort(key=lambda candidate: (candidate["source_window_entry"].get("role", ""), int(candidate["source_window_entry"].get("source_in", 0)), candidate["candidate_id"]))
     selected_matches = source_window_matches_from_candidates(request, reference_features, selected_candidates, ranked[0])
     return source_window_result(request, model_manifest, reference_features, reranker_model, ranked, selected_matches)
+
+
+def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], ranked: list[dict]) -> list[dict]:
+    if not ranked:
+        return ranked
+    candidate_by_group = {str(candidate.get("candidate_group_id") or candidate["candidate_id"]): candidate for candidate in candidates}
+    rescored = []
+    media_rescore_limit = 2
+    for rank_index, item in enumerate(ranked):
+        candidate = candidate_by_group.get(str(item.get("candidate_id", "")))
+        if candidate is None or rank_index >= media_rescore_limit:
+            updated = dict(item)
+            if rank_index >= media_rescore_limit:
+                updated["media_window"] = {"distance": None, "skipped": True, "reason": "outside_media_rescore_top_n"}
+            rescored.append(updated)
+            continue
+        media = media_window_rescore(request.reference_path, reference_features, candidate)
+        if media is None or media.get("distance") is None:
+            updated = dict(item)
+            updated["media_window"] = media
+            rescored.append(updated)
+            continue
+        updated = dict(item)
+        media_distance = float(media["distance"])
+        feature_distance = float(item.get("distance", float("inf")))
+        updated["feature_distance"] = round(feature_distance, 6) if feature_distance != float("inf") else float("inf")
+        updated["media_window"] = media
+        updated["distance"] = round((feature_distance * 0.60) + (media_distance * 0.40), 6)
+        updated["raw_distance"] = updated["distance"]
+        updated["window_candidates"] = annotate_media_window_candidates(item.get("window_candidates", []), media)
+        rescored.append(updated)
+    return sorted(rescored, key=lambda row: (float(row["distance"]), row["candidate_id"]))
+
+
+def annotate_media_window_candidates(window_candidates: list[dict], media: dict) -> list[dict]:
+    if not window_candidates:
+        return window_candidates
+    annotated = []
+    for index, candidate in enumerate(window_candidates):
+        updated = dict(candidate)
+        if index == 0:
+            updated["media_distance"] = media.get("distance")
+            updated["source_in"] = int(media.get("source_in", updated.get("source_in", 0)))
+            updated["source_out"] = int(media.get("source_out", updated.get("source_out", updated.get("source_in", 0) + 1)))
+        annotated.append(updated)
+    return annotated
 
 
 def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -> dict:
@@ -165,6 +213,7 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
 
 
 def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict, reference_features: dict, reranker_model: dict | None, ranked: list[dict], matches: list[dict]) -> dict:
+    diagnostics = source_window_diagnostics(request, reference_features, ranked)
     return {
         "schema_version": "0.1.0",
         "model_id": model_manifest["model_id"],
@@ -179,8 +228,65 @@ def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict
             "top_candidates": ranked[:10],
             "reranker_model": reranker_model_summary(reranker_model),
         },
+        "diagnostics": diagnostics,
         "matches": matches,
     }
+
+
+def source_window_diagnostics(request: SourceWindowMatchRequest, reference_features: dict, ranked: list[dict]) -> dict:
+    reference_window = reference_features.get("source_window") if isinstance(reference_features.get("source_window"), dict) else {}
+    reference_start = int(reference_window.get("source_in", 0) or 0)
+    reference_end = int(reference_window.get("source_out", reference_start + max(1, int(reference_features.get("duration_frames", 0) or 1))) or reference_start + 1)
+    reference_segment_id = str(reference_window.get("source_clip_id") or Path(request.reference_feature_manifest_path).stem)
+    selected_id = str(ranked[0]["candidate_id"]) if ranked else ""
+    candidate_rows = []
+    for item in ranked:
+        candidate_id = str(item.get("candidate_id", ""))
+        window = item.get("window_candidates", [{}])[0] if item.get("window_candidates") else {}
+        source_start = int(window.get("source_in", item.get("source_in", 0)) or 0)
+        source_end = int(window.get("source_out", item.get("source_out", source_start + 1)) or source_start + 1)
+        raw_distance = float(item.get("raw_distance", item.get("distance", float("inf"))))
+        final_distance = float(item.get("distance", float("inf")))
+        candidate_rows.append(
+            {
+                "referenceSegmentId": reference_segment_id,
+                "candidateSourceSegmentId": candidate_source_segment_id(candidate_id),
+                "candidateSourceStartFrame": source_start,
+                "candidateSourceEndFrame": source_end,
+                "referenceStartFrame": reference_start,
+                "referenceEndFrame": reference_end,
+                "visualScore": confidence_from_distance(raw_distance if raw_distance != float("inf") else None),
+                "temporalOrderScore": None,
+                "modelScore": confidence_from_distance(final_distance if final_distance != float("inf") else None),
+                "finalScore": confidence_from_distance(final_distance if final_distance != float("inf") else None),
+                "selected": candidate_id == selected_id,
+                "rejectionReason": "" if candidate_id == selected_id else "lower_ranked_candidate",
+            }
+        )
+    return {
+        "rankedCandidates": candidate_rows,
+        "globalAssignment": {
+            "assignmentMethod": "per_reference_ranking",
+            "skippedReferenceSegments": [],
+            "skippedSourceSegments": [],
+            "selectedPairs": [
+                {
+                    "referenceSegmentId": reference_segment_id,
+                    "candidateSourceSegmentId": candidate_rows[0]["candidateSourceSegmentId"],
+                    "candidateSourceStartFrame": candidate_rows[0]["candidateSourceStartFrame"],
+                    "score": candidate_rows[0]["finalScore"],
+                }
+            ] if candidate_rows else [],
+            "globalScore": candidate_rows[0]["finalScore"] if candidate_rows else 0.0,
+            "confidenceCalibrationNotes": "Single-reference source-window ranking; batch monotonic assignment is available in fixture evaluation.",
+        },
+    }
+
+
+def candidate_source_segment_id(candidate_id: str) -> str:
+    if "_refcut_" in candidate_id:
+        return candidate_id.split("_refcut_", 1)[0]
+    return candidate_id
 
 
 def match(request: MatchRequest) -> dict:
