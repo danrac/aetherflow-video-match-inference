@@ -87,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
         "after_effects_extendscript": str(ae_path),
         "match_count": len(match_result.get("matches", [])),
         "top_candidate_id": top_candidate.get("candidate_id"),
+        "top_candidate_clip_id": top_candidate.get("clip_id"),
         "top_candidate_clip_ids": top_candidate.get("clip_ids", []),
         "top_distance": top_candidate.get("distance"),
     }

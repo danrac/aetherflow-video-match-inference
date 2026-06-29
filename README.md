@@ -114,7 +114,7 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli validate-source-w
 Run production source-window matching from a request JSON:
 
 ```bash
-PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli match-source-windows \
+PYTHONPATH=src python3 -m aetherflow_video_match_inference match-source-windows \
   --request /path/to/request.json \
   --output /path/to/match_result.json
 ```
@@ -155,6 +155,21 @@ PYTHONPATH=src python3 scripts/run-source-window-profile-smoke-grid.py \
   --transform crop \
   --transform letterbox
 ```
+
+Run a filtered source-window batch over selected clips, transforms, or sample IDs:
+
+```bash
+PYTHONPATH=src python3 scripts/run-source-window-profile-batch.py \
+  --profile configs/public-source-generalization-v0002.example.json \
+  --dataset-manifest "$AETHERFLOW_VIDEO_MATCH_DATA_ROOT/datasets/public-source-generalization/v0002/dataset_manifest.json" \
+  --output-dir /path/to/batch-output \
+  --clip-id 0001-gsfc-20140421-earthorbit-m11525-mobile-fba6c3e2f025 \
+  --transform reverse \
+  --limit 25 \
+  --skip-existing
+```
+
+The batch report includes one smoke folder per selected sample plus `batch_report.json` with expected source clip IDs, transform types, top-candidate IDs, and whether the top candidate matched an expected source clip.
 
 Run cached profile evaluation:
 
