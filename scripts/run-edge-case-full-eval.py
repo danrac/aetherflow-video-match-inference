@@ -24,6 +24,7 @@ def main(argv: list[str]) -> int:
     root = dataset_manifest.parent
     dataset = load_json(dataset_manifest)
     candidate_features = load_source_window_candidates(root, dataset)
+    candidate_groups = prepare_candidate_groups(candidate_features)
     results = []
 
     for sample in dataset.get("samples", []):
@@ -35,7 +36,7 @@ def main(argv: list[str]) -> int:
         transforms = transforms_from_ground_truth(ground_truth)
         transform_types = transform_types_from_transforms(transforms)
         expected_clip_ids = source_clip_ids_from_ground_truth(ground_truth)
-        ranked = rank_candidates(reference_features, candidate_features, transforms)
+        ranked = rank_prepared_candidate_groups(reference_features, candidate_groups, transforms)
         expected_ranks = [index + 1 for index, candidate in enumerate(ranked) if ranked_item_matches_expected(candidate, expected_clip_ids)]
         if not expected_ranks:
             continue
@@ -108,17 +109,47 @@ def rank_candidates(reference_features: dict, candidates: list[dict], reference_
 
 
 def rank_candidate_groups(reference_features: dict, candidates: list[dict], reference_transforms: list[dict]) -> list[dict]:
-    reference_transform_types = transform_types_from_transforms(reference_transforms)
+    return rank_prepared_candidate_groups(reference_features, prepare_candidate_groups(candidates), reference_transforms)
+
+
+def prepare_candidate_groups(candidates: list[dict]) -> list[dict]:
     grouped = defaultdict(list)
     for candidate in candidates:
         grouped[str(candidate.get("candidate_group_id") or candidate["candidate_id"])].append(candidate)
 
-    ranked = []
+    prepared_groups = []
     for group_id, group_candidates in grouped.items():
+        ordered_features = [candidate["features"] for candidate in group_candidates]
+        combined_features = combine_feature_documents(ordered_features)
+        parallel_candidates = parallel_contributor_candidates(group_candidates)
+        parallel_documents = [candidate["features"] for candidate in parallel_candidates]
+        parallel_features = combine_parallel_feature_documents(parallel_candidates) if parallel_candidates else None
+        prepared_groups.append(
+            {
+                "group_id": str(group_id),
+                "group_candidates": group_candidates,
+                "ordered_features": ordered_features,
+                "combined_features": combined_features,
+                "parallel_documents": parallel_documents,
+                "parallel_features": parallel_features,
+                "clip_ids": sorted({candidate["clip_id"] for candidate in group_candidates}),
+            }
+        )
+    return prepared_groups
+
+
+def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: list[dict], reference_transforms: list[dict]) -> list[dict]:
+    reference_transform_types = transform_types_from_transforms(reference_transforms)
+    ranked = []
+    for group in prepared_groups:
+        group_id = str(group["group_id"])
+        group_candidates = group["group_candidates"]
+        ordered_features = group["ordered_features"]
+        combined_features = group["combined_features"]
+        parallel_documents = group["parallel_documents"]
+        parallel_features = group["parallel_features"]
         scored_windows = []
-        ordered_features = []
         for candidate in group_candidates:
-            ordered_features.append(candidate["features"])
             distance = color_distance(reference_features, candidate["features"])
             scored_windows.append(
                 {
@@ -127,11 +158,7 @@ def rank_candidate_groups(reference_features: dict, candidates: list[dict], refe
                     "distance": distance if distance is not None else float("inf"),
                 }
             )
-        combined_features = combine_feature_documents(ordered_features)
         combined_distance = color_distance(reference_features, combined_features) if combined_features is not None else None
-        parallel_candidates = parallel_contributor_candidates(group_candidates)
-        parallel_features = combine_parallel_feature_documents(parallel_candidates) if parallel_candidates else None
-        parallel_documents = [candidate["features"] for candidate in parallel_candidates]
         parallel_distance = color_distance(reference_features, parallel_features) if parallel_features is not None else None
         panel_layout_distance = (
             parallel_panel_layout_distance(reference_features, parallel_documents)
@@ -154,7 +181,7 @@ def rank_candidate_groups(reference_features: dict, candidates: list[dict], refe
         average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
         tail_distance = tail_visual_distance(reference_features, combined_features, start_fraction=0.7) if combined_features is not None else None
         group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance, spatial_distance, pip_overlay_distance)
-        clip_ids = sorted({item["clip_id"] for item in scored_windows})
+        clip_ids = group["clip_ids"]
         family_penalty = candidate_family_penalty(ordered_features, reference_transform_types) + split_panel_count_penalty
         ranked.append(
             {
@@ -176,7 +203,7 @@ def combine_feature_documents(feature_documents: list[dict]) -> dict | None:
         frames.extend(frame for frame in document.get("features", []) if isinstance(frame, dict))
     if not frames:
         return None
-    return {"features": frames, "temporal_signature": binned_temporal_signature(frames, bins=8)}
+    return {"features": frames, "motion_track_summary": motion_track_summary_from_frames(frames), "temporal_signature": binned_temporal_signature(frames, bins=8)}
 
 
 def is_parallel_contributor_group(feature_documents: list[dict]) -> bool:
@@ -265,8 +292,17 @@ def simple_cut_segment_sequence_distance(reference_features: dict, feature_docum
         candidate_frames = [frame for frame in document.get("features", []) if isinstance(frame, dict)]
         if not chunk_frames or not candidate_frames:
             continue
-        candidate_document = {"features": candidate_frames, "temporal_signature": binned_temporal_signature(candidate_frames, bins=8)}
-        distance = color_distance({"features": chunk_frames, "temporal_signature": binned_temporal_signature(chunk_frames, bins=8)}, candidate_document)
+        candidate_document = {
+            "features": candidate_frames,
+            "motion_track_summary": motion_track_summary_from_frames(candidate_frames),
+            "temporal_signature": binned_temporal_signature(candidate_frames, bins=8),
+        }
+        reference_document = {
+            "features": chunk_frames,
+            "motion_track_summary": motion_track_summary_from_frames(chunk_frames),
+            "temporal_signature": binned_temporal_signature(chunk_frames, bins=8),
+        }
+        distance = color_distance(reference_document, candidate_document)
         if distance is not None:
             distances.append(distance)
     if not distances:
@@ -300,7 +336,7 @@ def combine_parallel_feature_documents(candidates: list[dict]) -> dict | None:
     if frame_count <= 0:
         return None
     frames = [average_frame_features([frames[index] for frames in feature_rows], panel_count=len(feature_rows)) for index in range(frame_count)]
-    return {"features": frames, "temporal_signature": binned_temporal_signature(frames, bins=8)}
+    return {"features": frames, "motion_track_summary": motion_track_summary_from_frames(frames), "temporal_signature": binned_temporal_signature(frames, bins=8)}
 
 
 def average_frame_features(frames: list[dict], panel_count: int | None = None) -> dict:
@@ -725,8 +761,63 @@ def average_optional_scalar(values: list) -> float | None:
 def average_flow(flows: list[dict]) -> dict:
     return {
         field: average_optional_scalar([flow.get(field) for flow in flows])
-        for field in ("mean_magnitude", "mean_dx", "mean_dy")
+        for field in (
+            "mean_magnitude",
+            "mean_dx",
+            "mean_dy",
+            "mean_magnitude_normalized",
+            "mean_dx_normalized",
+            "mean_dy_normalized",
+            "tracked_point_ratio",
+            "motion_consistency",
+        )
     }
+
+
+def motion_track_summary_from_frames(frames: list[dict]) -> dict:
+    flows = [frame.get("optical_flow") for frame in frames if isinstance(frame.get("optical_flow"), dict)]
+    valid_flows = [flow for flow in flows if int(flow.get("tracked_points") or 0) > 0]
+    if not flows:
+        return {
+            "tracked_frame_pairs": 0,
+            "mean_magnitude_normalized": 0.0,
+            "max_magnitude_normalized": 0.0,
+            "mean_tracked_point_ratio": 0.0,
+            "mean_motion_consistency": 0.0,
+            "dominant_axis": "none",
+        }
+    magnitudes = [float(normalized_flow_value(flow, "mean_magnitude") or 0.0) for flow in flows]
+    tracked_ratios = [float(flow.get("tracked_point_ratio") or 0.0) for flow in flows]
+    consistencies = [float(flow.get("motion_consistency") or 0.0) for flow in valid_flows]
+    mean_dx = sum(float(normalized_flow_value(flow, "mean_dx") or 0.0) for flow in valid_flows)
+    mean_dy = sum(float(normalized_flow_value(flow, "mean_dy") or 0.0) for flow in valid_flows)
+    return {
+        "tracked_frame_pairs": len(valid_flows),
+        "mean_magnitude_normalized": round(sum(magnitudes) / len(magnitudes), 6),
+        "max_magnitude_normalized": round(max(magnitudes), 6),
+        "mean_tracked_point_ratio": round(sum(tracked_ratios) / len(tracked_ratios), 6),
+        "mean_motion_consistency": round(sum(consistencies) / len(consistencies), 6) if consistencies else 0.0,
+        "dominant_axis": dominant_motion_axis(mean_dx, mean_dy),
+    }
+
+
+def normalized_flow_value(flow: dict, base_field: str) -> float | None:
+    normalized_field = f"{base_field}_normalized"
+    if flow.get(normalized_field) is not None:
+        return float(flow[normalized_field])
+    if base_field == "mean_magnitude" and flow.get("mean_magnitude") is not None:
+        return float(flow["mean_magnitude"]) / 255.0
+    if base_field == "mean_dx" and flow.get("mean_dx") is not None:
+        return float(flow["mean_dx"]) / float(flow.get("frame_width") or 255.0)
+    if base_field == "mean_dy" and flow.get("mean_dy") is not None:
+        return float(flow["mean_dy"]) / float(flow.get("frame_height") or 255.0)
+    return None
+
+
+def dominant_motion_axis(mean_dx: float, mean_dy: float) -> str:
+    if abs(mean_dx) < 1e-9 and abs(mean_dy) < 1e-9:
+        return "none"
+    return "horizontal" if abs(mean_dx) >= abs(mean_dy) else "vertical"
 
 
 def binned_temporal_signature(frames: list[dict], bins: int) -> list[list[float]]:
