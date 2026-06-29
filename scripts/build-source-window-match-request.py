@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 
@@ -31,10 +32,10 @@ def main(argv: list[str] | None = None) -> int:
     if target_sample is None:
         raise ValueError(f"sample_id not found in dataset manifest: {args.sample_id}")
 
-    model_manifest = args.model_manifest or profile.get("model_manifest")
+    model_manifest = expand_profile_path(args.model_manifest or profile.get("model_manifest"))
     if not model_manifest:
         raise ValueError("--model-manifest is required unless --profile provides model_manifest")
-    reranker_model = args.reranker_model or profile.get("reranker_model")
+    reranker_model = expand_profile_path(args.reranker_model or profile.get("reranker_model"))
 
     candidates = []
     group_count = 0
@@ -103,6 +104,12 @@ def transforms_from_ground_truth(dataset_root: Path, sample: dict) -> list[dict]
 def resolve_dataset_path(dataset_root: Path, path: str) -> str:
     candidate = Path(path)
     return str(candidate if candidate.is_absolute() else dataset_root / candidate)
+
+
+def expand_profile_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+    return os.path.expandvars(path)
 
 
 def load_json(path: str | Path) -> dict:

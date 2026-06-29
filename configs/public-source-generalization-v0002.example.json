@@ -1,0 +1,14 @@
+{
+  "profile_id": "public-source-generalization-v0002-temporal-hybrid",
+  "data_root_env": "AETHERFLOW_VIDEO_MATCH_DATA_ROOT",
+  "dataset_manifest": "${AETHERFLOW_VIDEO_MATCH_DATA_ROOT}/datasets/public-source-generalization/v0002/dataset_manifest.json",
+  "model_manifest": "${AETHERFLOW_VIDEO_MATCH_DATA_ROOT}/models/public-source-generalization-baseline/v0002-reverse-aware-expanded/model_manifest.json",
+  "reranker_model": "${AETHERFLOW_VIDEO_MATCH_DATA_ROOT}/models/public-source-generalization-reranker/v0002-cache-trained/reranker_model.json",
+  "reranker_onnx": "${AETHERFLOW_VIDEO_MATCH_DATA_ROOT}/models/public-source-generalization-reranker/v0002-cache-trained/reranker.onnx",
+  "candidate_index": "${AETHERFLOW_VIDEO_MATCH_DATA_ROOT}/indexes/public-source-generalization/v0002/source_window_candidate_index.json",
+  "reranker_component_cache": "${AETHERFLOW_VIDEO_MATCH_DATA_ROOT}/indexes/public-source-generalization/v0002/reranker_component_cache.json",
+  "runtime": {
+    "provider": "onnxruntime",
+    "preferred_execution_provider": "CPUExecutionProvider"
+  }
+}

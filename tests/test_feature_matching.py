@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -479,12 +480,20 @@ class FeatureMatchingTests(unittest.TestCase):
             request_path = root / "request.json"
             output_path = root / "match.json"
             profile_path = root / "profile.json"
-            write_json(profile_path, {"model_manifest": str(model_manifest)})
+            old_data_root = os.environ.get("AETHERFLOW_VIDEO_MATCH_DATA_ROOT")
+            os.environ["AETHERFLOW_VIDEO_MATCH_DATA_ROOT"] = str(root)
+            write_json(profile_path, {"model_manifest": "${AETHERFLOW_VIDEO_MATCH_DATA_ROOT}/model_manifest.json"})
             builder = load_request_builder_script()
 
-            exit_code = builder.main(["--dataset-manifest", str(manifest), "--sample-id", "sample-a", "--profile", str(profile_path), "--output", str(request_path)])
-            cli_exit_code = cli_main(["match-source-windows", "--request", str(request_path), "--output", str(output_path)])
-            result = json.loads(output_path.read_text(encoding="utf-8"))
+            try:
+                exit_code = builder.main(["--dataset-manifest", str(manifest), "--sample-id", "sample-a", "--profile", str(profile_path), "--output", str(request_path)])
+                cli_exit_code = cli_main(["match-source-windows", "--request", str(request_path), "--output", str(output_path)])
+                result = json.loads(output_path.read_text(encoding="utf-8"))
+            finally:
+                if old_data_root is None:
+                    del os.environ["AETHERFLOW_VIDEO_MATCH_DATA_ROOT"]
+                else:
+                    os.environ["AETHERFLOW_VIDEO_MATCH_DATA_ROOT"] = old_data_root
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(cli_exit_code, 0)
