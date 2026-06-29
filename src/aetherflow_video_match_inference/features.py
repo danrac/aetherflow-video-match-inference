@@ -18,11 +18,11 @@ def load_feature_manifest(path: str | Path) -> dict[str, Any]:
     return document
 
 
-def color_distance(reference_features: dict[str, Any], source_features: dict[str, Any]) -> float | None:
-    return visual_distance(reference_features, source_features)
+def color_distance(reference_features: dict[str, Any], source_features: dict[str, Any], *, allow_temporal_reverse: bool = True) -> float | None:
+    return visual_distance(reference_features, source_features, allow_temporal_reverse=allow_temporal_reverse)
 
 
-def visual_distance(reference_features: dict[str, Any], source_features: dict[str, Any]) -> float | None:
+def visual_distance(reference_features: dict[str, Any], source_features: dict[str, Any], *, allow_temporal_reverse: bool = True) -> float | None:
     reference_vector = average_mean_rgb(reference_features)
     source_vector = average_mean_rgb(source_features)
     if reference_vector is None or source_vector is None:
@@ -32,7 +32,7 @@ def visual_distance(reference_features: dict[str, Any], source_features: dict[st
         color_component
         + grid_delta(reference_features, source_features, weight=0.35)
         + histogram_delta(reference_features, source_features, "active_hue_histogram", weight=80.0)
-        + temporal_signature_delta(reference_features, source_features, weight=120.0)
+        + temporal_signature_delta(reference_features, source_features, weight=120.0, allow_reverse=allow_temporal_reverse)
         + brightest_frame_delta(reference_features, source_features, weight=0.4)
         + scalar_delta(reference_features, source_features, "mean_absdiff_from_previous", weight=1.0)
         + scalar_delta(reference_features, source_features, "mean_luma", weight=0.25)
@@ -127,13 +127,16 @@ def average_histogram(feature_document: dict[str, Any], field: str) -> list[floa
     return cache[cache_key]
 
 
-def temporal_signature_delta(reference_features: dict[str, Any], source_features: dict[str, Any], weight: float) -> float:
+def temporal_signature_delta(reference_features: dict[str, Any], source_features: dict[str, Any], weight: float, *, allow_reverse: bool = True) -> float:
     reference_signature = temporal_signature(reference_features)
     source_signature = temporal_signature(source_features)
     if reference_signature is None or source_signature is None:
         return 0.0
+    forward_distance = temporal_signature_distance(reference_signature, source_signature)
+    if not allow_reverse:
+        return forward_distance * weight
     return min(
-        temporal_signature_distance(reference_signature, source_signature),
+        forward_distance,
         temporal_signature_distance(reference_signature, list(reversed(source_signature))),
     ) * weight
 

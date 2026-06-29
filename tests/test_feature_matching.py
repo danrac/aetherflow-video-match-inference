@@ -162,6 +162,7 @@ class FeatureMatchingTests(unittest.TestCase):
 
         self.assertEqual(visual_distance(reference, source_reversed), 0.0)
         self.assertEqual(visual_distance(reference_with_flow, source_with_opposite_flow), 0.0)
+        self.assertGreater(visual_distance(reference, source_reversed, allow_temporal_reverse=False), 0.0)
 
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:

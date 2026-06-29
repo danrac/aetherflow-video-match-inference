@@ -140,6 +140,7 @@ def prepare_candidate_groups(candidates: list[dict]) -> list[dict]:
 
 def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: list[dict], reference_transforms: list[dict]) -> list[dict]:
     reference_transform_types = transform_types_from_transforms(reference_transforms)
+    is_reverse_reference = "reverse" in reference_transform_types
     ranked = []
     for group in prepared_groups:
         group_id = str(group["group_id"])
@@ -148,9 +149,14 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
         combined_features = group["combined_features"]
         parallel_documents = group["parallel_documents"]
         parallel_features = group["parallel_features"]
+        scoring_ordered_features = reverse_feature_documents_for_playback(ordered_features) if is_reverse_reference else ordered_features
+        scoring_combined_features = reverse_feature_document(combined_features) if is_reverse_reference and combined_features is not None else combined_features
+        scoring_parallel_documents = [reverse_feature_document(document) for document in parallel_documents] if is_reverse_reference else parallel_documents
+        scoring_parallel_features = reverse_feature_document(parallel_features) if is_reverse_reference and parallel_features is not None else parallel_features
         scored_windows = []
         for candidate in group_candidates:
-            distance = color_distance(reference_features, candidate["features"])
+            scoring_features = reverse_feature_document(candidate["features"]) if is_reverse_reference else candidate["features"]
+            distance = color_distance(reference_features, scoring_features, allow_temporal_reverse=not is_reverse_reference)
             scored_windows.append(
                 {
                     "candidate_id": candidate["candidate_id"],
@@ -158,28 +164,28 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
                     "distance": distance if distance is not None else float("inf"),
                 }
             )
-        combined_distance = color_distance(reference_features, combined_features) if combined_features is not None else None
-        parallel_distance = color_distance(reference_features, parallel_features) if parallel_features is not None else None
+        combined_distance = color_distance(reference_features, scoring_combined_features, allow_temporal_reverse=not is_reverse_reference) if scoring_combined_features is not None else None
+        parallel_distance = color_distance(reference_features, scoring_parallel_features, allow_temporal_reverse=not is_reverse_reference) if scoring_parallel_features is not None else None
         panel_layout_distance = (
-            parallel_panel_layout_distance(reference_features, parallel_documents)
-            if "split_screen" in reference_transform_types and parallel_documents
+            parallel_panel_layout_distance(reference_features, scoring_parallel_documents)
+            if "split_screen" in reference_transform_types and scoring_parallel_documents
             else None
         )
         split_panel_count_penalty = split_screen_panel_count_penalty(reference_transforms, parallel_documents)
         segment_sequence_distance = (
-            simple_cut_segment_sequence_distance(reference_features, ordered_features)
-            if "simple_cut" in reference_transform_types and is_segment_sequence_group(ordered_features)
+            simple_cut_segment_sequence_distance(reference_features, scoring_ordered_features)
+            if "simple_cut" in reference_transform_types and is_segment_sequence_group(scoring_ordered_features)
             else None
         )
         pip_overlay_distance = (
-            picture_in_picture_overlay_distance(reference_features, parallel_documents, reference_transforms)
-            if "picture_in_picture" in reference_transform_types and parallel_documents
+            picture_in_picture_overlay_distance(reference_features, scoring_parallel_documents, reference_transforms)
+            if "picture_in_picture" in reference_transform_types and scoring_parallel_documents
             else None
         )
-        spatial_distance = spatial_transform_distance(reference_features, combined_features, reference_transforms) if combined_features is not None else None
+        spatial_distance = spatial_transform_distance(reference_features, scoring_combined_features, reference_transforms) if scoring_combined_features is not None else None
         finite_distances = [float(item["distance"]) for item in scored_windows if item["distance"] != float("inf")]
         average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
-        tail_distance = tail_visual_distance(reference_features, combined_features, start_fraction=0.7) if combined_features is not None else None
+        tail_distance = tail_visual_distance(reference_features, scoring_combined_features, start_fraction=0.7, allow_temporal_reverse=not is_reverse_reference) if scoring_combined_features is not None else None
         group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance, spatial_distance, pip_overlay_distance)
         clip_ids = group["clip_ids"]
         family_penalty = candidate_family_penalty(ordered_features, reference_transform_types) + split_panel_count_penalty
@@ -195,6 +201,34 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
             }
         )
     return sorted(ranked, key=lambda item: (float(item["distance"]), item["candidate_id"]))
+
+
+def reverse_feature_documents_for_playback(feature_documents: list[dict]) -> list[dict]:
+    return [reverse_feature_document(document) for document in reversed(feature_documents)]
+
+
+def reverse_feature_document(feature_document: dict | None) -> dict | None:
+    if feature_document is None:
+        return None
+    frames = [reverse_frame_for_playback(frame) for frame in reversed(feature_document.get("features", [])) if isinstance(frame, dict)]
+    reversed_document = {key: value for key, value in feature_document.items() if key not in {"features", "temporal_signature", "motion_track_summary", "_aetherflow_feature_cache"}}
+    reversed_document["features"] = frames
+    if frames:
+        reversed_document["motion_track_summary"] = motion_track_summary_from_frames(frames)
+        reversed_document["temporal_signature"] = binned_temporal_signature(frames, bins=8)
+    return reversed_document
+
+
+def reverse_frame_for_playback(frame: dict) -> dict:
+    reversed_frame = dict(frame)
+    flow = frame.get("optical_flow")
+    if isinstance(flow, dict):
+        reversed_flow = dict(flow)
+        for field in ("mean_dx", "mean_dy", "mean_dx_normalized", "mean_dy_normalized"):
+            if reversed_flow.get(field) is not None:
+                reversed_flow[field] = -float(reversed_flow[field])
+        reversed_frame["optical_flow"] = reversed_flow
+    return reversed_frame
 
 
 def combine_feature_documents(feature_documents: list[dict]) -> dict | None:
@@ -832,12 +866,12 @@ def binned_temporal_signature(frames: list[dict], bins: int) -> list[list[float]
     return signature
 
 
-def tail_visual_distance(reference_features: dict, source_features: dict, start_fraction: float) -> float | None:
+def tail_visual_distance(reference_features: dict, source_features: dict, start_fraction: float, *, allow_temporal_reverse: bool = True) -> float | None:
     reference_tail = tail_feature_document(reference_features, start_fraction)
     source_tail = tail_feature_document(source_features, start_fraction)
     if reference_tail is None or source_tail is None:
         return None
-    return color_distance(reference_tail, source_tail)
+    return color_distance(reference_tail, source_tail, allow_temporal_reverse=allow_temporal_reverse)
 
 
 def tail_feature_document(feature_document: dict, start_fraction: float) -> dict | None:
