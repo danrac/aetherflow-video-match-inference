@@ -9,7 +9,7 @@ from pathlib import Path
 from .adapters import to_host_payload
 from .engine import MatchRequest, match
 from .interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json
-from .onnx_runtime import validate_onnx_model
+from .onnx_runtime import validate_onnx_model, validate_reranker_onnx_model
 from .storage import inference_output_path
 
 
@@ -27,6 +27,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_model = subcommands.add_parser("validate-model")
     validate_model.add_argument("--model-manifest", required=True)
+
+    validate_reranker = subcommands.add_parser("validate-reranker-onnx")
+    validate_reranker.add_argument("--model", required=True)
+    validate_reranker.add_argument("--onnx", required=True)
 
     host = subcommands.add_parser("host-payload")
     host.add_argument("--match-result", required=True)
@@ -81,6 +85,9 @@ def main(argv: list[str] | None = None) -> int:
         with Path(args.model_manifest).open("r", encoding="utf-8") as handle:
             model_manifest = json.load(handle)
         print(json.dumps(validate_onnx_model(args.model_manifest, model_manifest), indent=2, sort_keys=True))
+        return 0
+    if args.command == "validate-reranker-onnx":
+        print(json.dumps(validate_reranker_onnx_model(args.model, args.onnx), indent=2, sort_keys=True))
         return 0
     if args.command == "host-payload":
         with Path(args.match_result).open("r", encoding="utf-8") as handle:
