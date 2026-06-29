@@ -342,6 +342,29 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(result["matches"][0]["source_out"], 27)
             self.assertEqual(result["ranking"]["top_candidates"][0]["candidate_id"], "edit-001")
 
+    def test_source_window_match_exports_to_host_payload_and_cep_json(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-host-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source_features = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            result = match_source_windows(
+                SourceWindowMatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    model_manifest_path=str(model_manifest),
+                    reference_feature_manifest_path=str(reference_features),
+                    candidates=(SourceWindowCandidate("candidate-a", "edit-001", "/tmp/a.mp4", "clip-a", str(source_features), 3, 27),),
+                )
+            )
+
+            payload = to_host_payload(result, "aetherflow")
+            cep_path = export_cep_json(payload, root / "aetherflow_cep.json")
+            cep_json = json.loads(cep_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["timeline"]["edits"][0]["operation"], "source_window_reranker_match")
+            self.assertEqual(cep_json["timeline"]["layers"][0]["operation"], "source_window_reranker_match")
+            self.assertEqual(cep_json["timeline"]["layers"][0]["parameters"]["candidate_group_id"], "edit-001")
+
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
             model_manifest = write_model_manifest(Path(temp_dir))
