@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 from .adapters import to_host_payload
-from .engine import MatchRequest, match
+from .engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, match, match_source_windows
 from .interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json
 from .onnx_runtime import validate_onnx_model, validate_reranker_onnx_model
 from .storage import inference_output_path
@@ -24,6 +24,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--reference-feature-manifest")
     run.add_argument("--source-feature-manifest", action="append", default=[])
     run.add_argument("--output")
+
+    source_windows = subcommands.add_parser("match-source-windows")
+    source_windows.add_argument("--request", required=True)
+    source_windows.add_argument("--output", required=True)
 
     validate_model = subcommands.add_parser("validate-model")
     validate_model.add_argument("--model-manifest", required=True)
@@ -81,6 +85,14 @@ def main(argv: list[str] | None = None) -> int:
         output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         print(output_path)
         return 0
+    if args.command == "match-source-windows":
+        request = load_source_window_match_request(args.request)
+        result = match_source_windows(request)
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(output_path)
+        return 0
     if args.command == "validate-model":
         with Path(args.model_manifest).open("r", encoding="utf-8") as handle:
             model_manifest = json.load(handle)
@@ -123,6 +135,38 @@ def main(argv: list[str] | None = None) -> int:
         print(export_after_effects_extendscript(host_payload, args.output, args.comp_name))
         return 0
     raise AssertionError(f"Unhandled command: {args.command}")
+
+
+def load_source_window_match_request(path: str | Path) -> SourceWindowMatchRequest:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise ValueError(f"Expected source-window request object at {path}")
+    candidates = []
+    for index, candidate in enumerate(document.get("candidates", [])):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"Expected candidate object at index {index}")
+        candidates.append(
+            SourceWindowCandidate(
+                candidate_id=str(candidate["candidate_id"]),
+                candidate_group_id=str(candidate["candidate_group_id"]),
+                source_path=str(candidate["source_path"]),
+                source_clip_id=str(candidate["source_clip_id"]),
+                feature_manifest_path=str(candidate["feature_manifest_path"]),
+                source_in=int(candidate["source_in"]),
+                source_out=int(candidate["source_out"]),
+                role=str(candidate.get("role", "source")),
+                timeline_track=int(candidate.get("timeline_track", 0)),
+            )
+        )
+    return SourceWindowMatchRequest(
+        reference_path=str(document["reference_path"]),
+        model_manifest_path=str(document["model_manifest_path"]),
+        reference_feature_manifest_path=str(document["reference_feature_manifest_path"]),
+        candidates=tuple(candidates),
+        transforms=tuple(document.get("transforms", [])),
+        reranker_model_path=str(document["reranker_model_path"]) if document.get("reranker_model_path") else None,
+    )
 
 
 if __name__ == "__main__":

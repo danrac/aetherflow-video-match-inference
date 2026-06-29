@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from aetherflow_video_match_inference.adapters import to_host_payload
+from aetherflow_video_match_inference.cli import main as cli_main
 from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, match, match_source_windows
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
@@ -303,6 +304,43 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertNotEqual(result["ranking"]["top_candidates"][0]["distance"], -9.0)
             self.assertEqual(result["matches"][0]["source_in"], 5)
             self.assertEqual(result["matches"][0]["source_out"], 29)
+
+    def test_cli_runs_source_window_match_from_json_request(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-cli-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source_features = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            request_path = root / "request.json"
+            output_path = root / "match.json"
+            write_json(
+                request_path,
+                {
+                    "reference_path": "/tmp/reference.mp4",
+                    "model_manifest_path": str(model_manifest),
+                    "reference_feature_manifest_path": str(reference_features),
+                    "transforms": [],
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-a",
+                            "candidate_group_id": "edit-001",
+                            "source_path": "/tmp/a.mp4",
+                            "source_clip_id": "clip-a",
+                            "feature_manifest_path": str(source_features),
+                            "source_in": 3,
+                            "source_out": 27,
+                        }
+                    ],
+                },
+            )
+
+            exit_code = cli_main(["match-source-windows", "--request", str(request_path), "--output", str(output_path)])
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(result["matches"][0]["source_in"], 3)
+            self.assertEqual(result["matches"][0]["source_out"], 27)
+            self.assertEqual(result["ranking"]["top_candidates"][0]["candidate_id"], "edit-001")
 
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
