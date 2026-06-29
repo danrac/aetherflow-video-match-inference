@@ -21,6 +21,7 @@ FULL_EVAL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-edge-c
 REQUEST_BUILDER_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build-source-window-match-request.py"
 PROFILE_SMOKE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-source-window-profile-smoke.py"
 PROFILE_SMOKE_GRID_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-source-window-profile-smoke-grid.py"
+PROFILE_CACHED_EVAL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-profile-cached-eval.py"
 
 
 class FeatureMatchingTests(unittest.TestCase):
@@ -246,6 +247,59 @@ class FeatureMatchingTests(unittest.TestCase):
 
             self.assertEqual(report["metrics"]["top1_accuracy"], 1.0)
             self.assertEqual(report["results"][0]["top_candidate_id"], "correct")
+
+    def test_profile_cached_eval_uses_profile_paths(self) -> None:
+        module = load_profile_cached_eval_script()
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-profile-cached-eval-") as temp_dir:
+            root = Path(temp_dir)
+            dataset_manifest = root / "dataset_manifest.json"
+            write_json(dataset_manifest, {"schema_version": "0.1.0", "dataset_id": "test", "dataset_version": "v0001", "samples": []})
+            model_path = root / "reranker_model.json"
+            write_reranker_model(model_path, bias=0.0)
+            cache_path = root / "component_cache.json"
+            write_json(
+                cache_path,
+                {
+                    "schema_version": "0.1.0",
+                    "feature_names": load_full_eval_script().FEATURE_NAMES,
+                    "sample_count": 1,
+                    "source_candidate_count": 1,
+                    "samples": [
+                        {
+                            "sample_id": "sample-a",
+                            "expected_clip_ids": ["clip-a"],
+                            "transform_types": ["scale_position"],
+                            "candidates": [
+                                {
+                                    "candidate_id": "candidate-a",
+                                    "clip_id": "clip-a",
+                                    "clip_ids": ["clip-a"],
+                                    "baseline_distance": 0.0,
+                                    "features": [0.0] * 10,
+                                    "window_count": 1,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            profile_path = root / "profile.json"
+            output_path = root / "report.json"
+            write_json(
+                profile_path,
+                {
+                    "dataset_manifest": str(dataset_manifest),
+                    "reranker_model": str(model_path),
+                    "reranker_component_cache": str(cache_path),
+                },
+            )
+
+            exit_code = module.main(["--profile", str(profile_path), "--output", str(output_path)])
+            report = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(report["metrics"]["top1_accuracy"], 1.0)
+            self.assertEqual(report["component_cache_path"], str(cache_path))
 
     def test_source_window_match_applies_reranker_to_simple_cut_groups(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-reranker-") as temp_dir:
@@ -861,6 +915,15 @@ def load_profile_smoke_grid_script():
     spec = importlib.util.spec_from_file_location("aetherflow_profile_smoke_grid_test_module", PROFILE_SMOKE_GRID_SCRIPT)
     if spec is None or spec.loader is None:
         raise RuntimeError("could not load profile smoke grid script")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_profile_cached_eval_script():
+    spec = importlib.util.spec_from_file_location("aetherflow_profile_cached_eval_test_module", PROFILE_CACHED_EVAL_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load profile cached eval script")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
