@@ -1,0 +1,27 @@
+{
+  "profile_id": "public-source-generalization-v0002-temporal-hybrid",
+  "data_root_env": "AETHERFLOW_VIDEO_MATCH_DATA_ROOT",
+  "data_root": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData",
+  "dataset_manifest": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/datasets/public-source-generalization/v0002/dataset_manifest.json",
+  "model_manifest": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/models/public-source-generalization-baseline/v0002-reverse-aware-expanded/model_manifest.json",
+  "reranker_model": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/models/public-source-generalization-reranker/v0002-cache-trained/reranker_model.json",
+  "reranker_onnx": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/models/public-source-generalization-reranker/v0002-cache-trained/reranker.onnx",
+  "candidate_index": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/indexes/public-source-generalization/v0002/source_window_candidate_index.json",
+  "reranker_component_cache": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/indexes/public-source-generalization/v0002/reranker_component_cache.json",
+  "validated_reports": {
+    "runtime_full_eval": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/inference/public-source-generalization-full-eval/v0002-cache-trained-reranker/report.json",
+    "runtime_cached_eval": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/inference/public-source-generalization-full-eval/v0002-cache-trained-reranker-cached-eval/report.json",
+    "source_window_request_smoke": "/Volumes/FrameFusion/AetherFlow_VideoMatcherData/inference/source-window-requests/public-v0002-reverse-sample/match_result.json"
+  },
+  "metrics": {
+    "top1_accuracy": 0.824233,
+    "top5_accuracy": 0.887809,
+    "top10_accuracy": 0.910247,
+    "mean_best_expected_rank": 6.257292
+  },
+  "runtime": {
+    "provider": "onnxruntime",
+    "validated_python": "/Users/danracusin/Library/Application Support/Adobe/CEP/extensions/AetherFlow_CEP/AetherFlow_Assets/runtime/venv/bin/python",
+    "validated_execution_provider": "CPUExecutionProvider"
+  }
+}
