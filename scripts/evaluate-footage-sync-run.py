@@ -332,12 +332,15 @@ def predict_source_start_with_model(model: dict, reference_duration: int, source
     slack = max(0, source_duration - reference_duration)
     identity_start = int(pair["identitySourceStartFrame"]) if pair.get("identitySourceStartFrame") is not None else source_in
     boundary_start = int(pair.get("candidateSourceStartFrame", identity_start))
+    boundary_observed = pair.get("boundaryDistance") is not None
     small_prior = round(slack * 0.67) if slack / max(1, reference_duration) <= 0.5 else round(slack * 0.5)
     center_prior = round(slack * 0.5)
     tail_prior = slack
     tail_trimmed_prior = max(0, slack - round(slack * 0.15))
     short_handle = slack / max(1, reference_duration) <= 0.25
     short_handle_tail_prior = tail_trimmed_prior if short_handle else 0
+    large_handle = slack / max(1, reference_duration) >= 1.0
+    large_handle_conservative_prior = round(slack * 0.42) if large_handle else 0
     features = {
         "bias": 1.0,
         "reference_duration": reference_duration / 300.0,
@@ -346,24 +349,30 @@ def predict_source_start_with_model(model: dict, reference_duration: int, source
         "handle_slack_ratio": slack / max(1, reference_duration),
         "identity_offset": (identity_start - source_in) / 300.0,
         "boundary_offset": (boundary_start - source_in) / 300.0,
+        "boundary_observed": 1.0 if boundary_observed else 0.0,
+        "boundary_offset_when_observed": (boundary_start - source_in) / 300.0 if boundary_observed else 0.0,
         "small_handle_prior_offset": small_prior / 300.0,
         "center_prior_offset": center_prior / 300.0,
         "tail_prior_offset": tail_prior / 300.0,
         "tail_trimmed_prior_offset": tail_trimmed_prior / 300.0,
         "short_handle_tail_prior_offset": short_handle_tail_prior / 300.0,
         "short_handle_tail_bias": 1.0 if short_handle else 0.0,
+        "large_handle_conservative_prior_offset": large_handle_conservative_prior / 300.0,
+        "large_handle_conservative_bias": 1.0 if large_handle else 0.0,
         "identity_boundary_delta": (boundary_start - identity_start) / 300.0,
         "singleton_segment": 1.0 if singleton_segment else 0.0,
     }
     ratio = float(features["handle_slack_ratio"])
     features["handle_slack_ratio_squared"] = ratio * ratio
     features["boundary_offset_x_handle_ratio"] = float(features["boundary_offset"]) * ratio
+    features["boundary_observed_x_handle_ratio"] = float(features["boundary_observed"]) * ratio
     features["identity_offset_x_handle_ratio"] = float(features["identity_offset"]) * ratio
     features["small_prior_x_handle_ratio"] = float(features["small_handle_prior_offset"]) * ratio
     features["center_prior_x_handle_ratio"] = float(features["center_prior_offset"]) * ratio
     features["tail_prior_x_handle_ratio"] = float(features["tail_prior_offset"]) * ratio
     features["tail_trimmed_prior_x_handle_ratio"] = float(features["tail_trimmed_prior_offset"]) * ratio
     features["short_handle_tail_prior_x_handle_ratio"] = float(features["short_handle_tail_prior_offset"]) * ratio
+    features["large_handle_conservative_prior_x_handle_ratio"] = float(features["large_handle_conservative_prior_offset"]) * ratio
     value = 0.0
     for index, name in enumerate(feature_names):
         value += float(weights[index]) * float(features.get(str(name), 0.0))
