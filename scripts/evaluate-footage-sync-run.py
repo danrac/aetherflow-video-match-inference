@@ -326,13 +326,18 @@ def report_row(row: dict) -> dict:
 def predict_source_start_with_model(model: dict, reference_duration: int, source_in: int, source_out: int, pair: dict, singleton_segment: bool) -> int | None:
     feature_names = model.get("feature_names")
     weights = model.get("weights")
-    if not isinstance(feature_names, list) or not isinstance(weights, list) or len(feature_names) != len(weights):
+    routed_model = model.get("model_type") == "routed_source_start_v1"
+    if not isinstance(feature_names, list):
         return None
+    if not routed_model and (not isinstance(weights, list) or len(feature_names) != len(weights)):
+        return None
+    if routed_model and not isinstance(weights, list):
+        weights = []
     source_duration = max(1, source_out - source_in)
     slack = max(0, source_duration - reference_duration)
     identity_start = int(pair["identitySourceStartFrame"]) if pair.get("identitySourceStartFrame") is not None else source_in
     boundary_start = int(pair.get("candidateSourceStartFrame", identity_start))
-    boundary_observed = pair.get("boundaryDistance") is not None
+    boundary_observed = pair.get("boundaryDistance") is not None and pair.get("handlePrior") != "singleton_large_handle_center"
     small_prior = round(slack * 0.67) if slack / max(1, reference_duration) <= 0.5 else round(slack * 0.5)
     center_prior = round(slack * 0.5)
     tail_prior = slack
@@ -340,7 +345,7 @@ def predict_source_start_with_model(model: dict, reference_duration: int, source
     short_handle = slack / max(1, reference_duration) <= 0.25
     short_handle_tail_prior = tail_trimmed_prior if short_handle else 0
     large_handle = slack / max(1, reference_duration) >= 1.0
-    large_handle_conservative_prior = round(slack * 0.42) if large_handle else 0
+    large_handle_conservative_prior = round(slack * 0.414) if large_handle else 0
     features = {
         "bias": 1.0,
         "reference_duration": reference_duration / 300.0,
@@ -373,11 +378,40 @@ def predict_source_start_with_model(model: dict, reference_duration: int, source
     features["tail_trimmed_prior_x_handle_ratio"] = float(features["tail_trimmed_prior_offset"]) * ratio
     features["short_handle_tail_prior_x_handle_ratio"] = float(features["short_handle_tail_prior_offset"]) * ratio
     features["large_handle_conservative_prior_x_handle_ratio"] = float(features["large_handle_conservative_prior_offset"]) * ratio
-    value = 0.0
-    for index, name in enumerate(feature_names):
-        value += float(weights[index]) * float(features.get(str(name), 0.0))
+    value = predict_source_start_route_value(model, features, feature_names, weights)
     offset = max(0, min(slack, round(value * 300.0)))
     return max(source_in, min(max(source_in, source_out - reference_duration), source_in + offset))
+
+
+def predict_source_start_route_value(model: dict, features: dict, feature_names: list, weights: list) -> float:
+    if model.get("model_type") == "routed_source_start_v1":
+        route = select_source_start_route(model, features)
+        if route.get("method") == "feature_offset":
+            return float(features.get(str(route.get("feature")), 0.0))
+        route_weights = route.get("weights", [])
+        if isinstance(route_weights, list):
+            return sum(float(route_weights[index]) * float(features.get(str(name), 0.0)) for index, name in enumerate(feature_names[: len(route_weights)]))
+    return sum(float(weights[index]) * float(features.get(str(name), 0.0)) for index, name in enumerate(feature_names))
+
+
+def select_source_start_route(model: dict, features: dict) -> dict:
+    for route in model.get("routes", []):
+        if source_start_route_condition_matches(route.get("condition", {}), features):
+            return route
+    fallback = model.get("fallback")
+    return fallback if isinstance(fallback, dict) else {}
+
+
+def source_start_route_condition_matches(condition: dict, features: dict) -> bool:
+    if "boundary_observed_min" in condition and float(features.get("boundary_observed", 0.0)) < float(condition["boundary_observed_min"]):
+        return False
+    if "boundary_observed_max" in condition and float(features.get("boundary_observed", 0.0)) > float(condition["boundary_observed_max"]):
+        return False
+    if "handle_slack_ratio_min" in condition and float(features.get("handle_slack_ratio", 0.0)) < float(condition["handle_slack_ratio_min"]):
+        return False
+    if "handle_slack_ratio_max" in condition and float(features.get("handle_slack_ratio", 0.0)) > float(condition["handle_slack_ratio_max"]):
+        return False
+    return True
 
 
 def load_optional_json(path: str | None) -> dict | None:
