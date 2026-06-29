@@ -99,7 +99,7 @@ def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, 
         return ranked
     candidate_by_group = {str(candidate.get("candidate_group_id") or candidate["candidate_id"]): candidate for candidate in candidates}
     rescored = []
-    media_rescore_limit = 2
+    media_rescore_limit = 6
     for rank_index, item in enumerate(ranked):
         candidate = candidate_by_group.get(str(item.get("candidate_id", "")))
         if candidate is None or rank_index >= media_rescore_limit:
@@ -119,7 +119,7 @@ def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, 
         feature_distance = float(item.get("distance", float("inf")))
         updated["feature_distance"] = round(feature_distance, 6) if feature_distance != float("inf") else float("inf")
         updated["media_window"] = media
-        updated["distance"] = round((feature_distance * 0.60) + (media_distance * 0.40), 6)
+        updated["distance"] = round((feature_distance * 0.10) + (media_distance * 0.90), 6)
         updated["raw_distance"] = updated["distance"]
         updated["window_candidates"] = annotate_media_window_candidates(item.get("window_candidates", []), media)
         rescored.append(updated)

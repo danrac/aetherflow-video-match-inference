@@ -17,6 +17,8 @@ from typing import Any
 
 COMPARE_SIZE = (90, 160)
 SOURCE_CROP_X_FACTORS = (0.15, 0.5, 0.85)
+SOURCE_CROP_Y_FACTORS = (0.5,)
+SOURCE_CROP_HEIGHT_FACTORS = (0.78, 1.0)
 _CV2_CAPTURES: dict[str, Any] = {}
 
 
@@ -99,17 +101,27 @@ def candidate_start_grid(source_in: int, max_start: int, rel_frames: list[int], 
         for frame in feature_document.get("features", [])
         if isinstance(frame, dict) and frame.get("frame_index") is not None
     ]
+    sampled_starts = []
     for sampled_frame in sampled_frames:
         for rel_frame in rel_frames:
-            coarse.append(sampled_frame - rel_frame)
-    refined = set()
-    for center in coarse:
-        for delta in (-2, 0, 2):
-            value = center + delta
-            if source_in <= value <= max_start:
-                refined.add(value)
-    midpoint = source_in + (max_start - source_in) // 2
-    return sorted(refined, key=lambda value: (abs(value - midpoint), value))[:10]
+            start = sampled_frame - rel_frame
+            if source_in <= start <= max_start:
+                sampled_starts.append(start)
+                coarse.append(start)
+    sampled_starts = sorted(set(sampled_starts))
+    for previous, current in zip(sampled_starts, sampled_starts[1:], strict=False):
+        midpoint = previous + ((current - previous) // 2)
+        coarse.append(midpoint)
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for deltas in ((0,), (-4, -2, 2, 4)):
+        for center in coarse:
+            for delta in deltas:
+                value = center + delta
+                if source_in <= value <= max_start and value not in seen:
+                    seen.add(value)
+                    ordered.append(value)
+    return ordered[:16]
 
 
 def score_candidate_start(source_path: str, start_frame: int, rel_frames: list[int], fps: float, reference_arrays: list[Any], np: Any, ImageOps: Any) -> float | None:
@@ -127,12 +139,21 @@ def best_crop_distance(reference_array: Any, source_frame: Any, np: Any, ImageOp
 
     source_rgb = source_frame.convert("RGB")
     width, height = source_rgb.size
-    crop_width = min(width, int(round(height * 9.0 / 16.0)))
     candidates = []
-    for factor in SOURCE_CROP_X_FACTORS:
-        left = int(round((width - crop_width) * factor))
-        crop = source_rgb.crop((left, 0, left + crop_width, height))
-        candidates.append(np.asarray(ImageOps.fit(crop, COMPARE_SIZE, method=Image.Resampling.BILINEAR), dtype=np.float32) / 255.0)
+    seen_boxes = set()
+    for height_factor in SOURCE_CROP_HEIGHT_FACTORS:
+        crop_height = min(height, max(1, int(round(height * height_factor))))
+        crop_width = min(width, max(1, int(round(crop_height * 9.0 / 16.0))))
+        for x_factor in SOURCE_CROP_X_FACTORS:
+            left = int(round((width - crop_width) * x_factor))
+            for y_factor in SOURCE_CROP_Y_FACTORS:
+                top = int(round((height - crop_height) * y_factor))
+                box = (left, top, left + crop_width, top + crop_height)
+                if box in seen_boxes:
+                    continue
+                seen_boxes.add(box)
+                crop = source_rgb.crop(box)
+                candidates.append(np.asarray(ImageOps.fit(crop, COMPARE_SIZE, method=Image.Resampling.BILINEAR), dtype=np.float32) / 255.0)
     return min(frame_distance(reference_array, candidate, np) for candidate in candidates)
 
 
@@ -150,7 +171,58 @@ def frame_distance(reference_array: Any, source_array: Any, np: Any) -> float:
     ref_hist = np.histogram(reference_array, bins=16, range=(0.0, 1.0), density=True)[0]
     src_hist = np.histogram(source_array, bins=16, range=(0.0, 1.0), density=True)[0]
     hist_distance = float(np.mean(np.abs(ref_hist - src_hist))) / 16.0
-    return (mse * 120.0) + (corr_distance * 35.0) + (hist_distance * 25.0)
+    edge_distance = structural_edge_distance(reference_array, source_array, np)
+    color_distance = (mse * 80.0) + (corr_distance * 25.0) + (hist_distance * 12.0) + (edge_distance * 20.0)
+    keypoint_distance = structural_keypoint_distance(reference_array, source_array, np)
+    if keypoint_distance is None:
+        return color_distance
+    return (color_distance * 0.25) + (keypoint_distance * 0.75)
+
+
+def structural_edge_distance(reference_array: Any, source_array: Any, np: Any) -> float:
+    reference_gray = np.mean(reference_array, axis=2)
+    source_gray = np.mean(source_array, axis=2)
+    ref_dy, ref_dx = np.gradient(reference_gray)
+    src_dy, src_dx = np.gradient(source_gray)
+    ref_edges = np.sqrt((ref_dx * ref_dx) + (ref_dy * ref_dy))
+    src_edges = np.sqrt((src_dx * src_dx) + (src_dy * src_dy))
+    edge_mse = float(np.mean((ref_edges - src_edges) ** 2))
+    ref_flat = ref_edges.reshape(-1)
+    src_flat = src_edges.reshape(-1)
+    if float(np.std(ref_flat)) <= 1e-6 or float(np.std(src_flat)) <= 1e-6:
+        edge_corr_distance = 1.0
+    else:
+        corr = float(np.corrcoef(ref_flat, src_flat)[0, 1])
+        edge_corr_distance = 1.0 - max(-1.0, min(1.0, corr))
+    return (edge_mse * 3.0) + edge_corr_distance
+
+
+def structural_keypoint_distance(reference_array: Any, source_array: Any, np: Any) -> float | None:
+    try:
+        import cv2
+    except Exception:
+        return None
+    reference_gray = (np.mean(reference_array, axis=2) * 255.0).clip(0, 255).astype("uint8")
+    source_gray = (np.mean(source_array, axis=2) * 255.0).clip(0, 255).astype("uint8")
+    try:
+        extractor = cv2.ORB_create(nfeatures=300)
+        reference_keypoints, reference_descriptors = extractor.detectAndCompute(reference_gray, None)
+        source_keypoints, source_descriptors = extractor.detectAndCompute(source_gray, None)
+    except Exception:
+        return None
+    if (
+        reference_descriptors is None
+        or source_descriptors is None
+        or len(reference_keypoints) < 6
+        or len(source_keypoints) < 6
+    ):
+        return None
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = sorted(matcher.match(reference_descriptors, source_descriptors), key=lambda match: match.distance)
+    if not matches:
+        return None
+    strongest = matches[:24]
+    return (sum(float(match.distance) for match in strongest) / len(strongest)) + (160.0 / max(1, len(strongest)))
 
 
 @lru_cache(maxsize=512)

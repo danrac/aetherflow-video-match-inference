@@ -10,6 +10,7 @@ from pathlib import Path
 
 from aetherflow_video_match_inference.cli import load_source_window_match_request
 from aetherflow_video_match_inference.engine import candidate_source_segment_id, match_source_windows
+from aetherflow_video_match_inference.sequence_assignment import assign_ranked_reference_sequence
 
 
 def main() -> int:
@@ -75,13 +76,13 @@ def main() -> int:
             )
 
     normal_rows = [row for row in rows if not row["microcut"] and row["expectedCandidateSourceSegmentId"]]
-    assignment = soft_monotonic_assignment(rows)
+    assignment = assign_ranked_reference_sequence(rows)
     report = {
         "schemaVersion": "1.0.0",
         "kind": "aetherflowVideoMatchFixtureEvaluation",
         "runDir": str(run_dir),
         "fixtureComparisonPath": str(comparison_path),
-        "metrics": metrics(normal_rows, rows, time.time() - started),
+        "metrics": metrics(normal_rows, rows, time.time() - started, assignment),
         "microcutHandling": [
             {
                 "referenceSegmentId": row["referenceSegmentId"],
@@ -93,13 +94,13 @@ def main() -> int:
             if row["microcut"]
         ],
         "globalAssignmentDiagnostics": {
-            "assignmentMethod": "soft_monotonic_dp_diagnostic",
+            "assignmentMethod": assignment["assignmentMethod"],
             "skippedReferenceSegments": skipped_references,
             "skippedSourceSegments": assignment["skippedSourceSegments"],
             "selectedPairs": assignment["selectedPairs"],
             "localTop1Pairs": selected_pairs,
             "globalScore": assignment["globalScore"],
-            "confidenceCalibrationNotes": "Soft order assignment is diagnostic only for this fixture because detected stringout segments may be shuffled or merged. Use selectedPairs as a CEP handoff candidate, not as a forced replacement yet.",
+            "confidenceCalibrationNotes": "Overlap-aware beam assignment is intended for batch stringout matching when per-reference top candidates are available.",
         },
         "results": rows,
     }
@@ -145,9 +146,11 @@ def expected_segment_for_request(request_doc: dict, expected_source_start: int) 
     return None
 
 
-def metrics(normal_rows: list[dict], all_rows: list[dict], runtime_duration: float) -> dict:
+def metrics(normal_rows: list[dict], all_rows: list[dict], runtime_duration: float, assignment: dict | None = None) -> dict:
     source_errors = [row["sourceStartFrameAbsError"] for row in normal_rows if row["sourceStartFrameAbsError"] is not None]
     reference_errors = [row["referenceStartFrameAbsError"] for row in normal_rows if row["referenceStartFrameAbsError"] is not None]
+    assignment_rows = sequence_assignment_rows(normal_rows, assignment or {})
+    assignment_source_errors = [row["sourceStartFrameAbsError"] for row in assignment_rows if row["sourceStartFrameAbsError"] is not None]
     return {
         "referenceSegmentCount": len(all_rows),
         "normalEvaluatedSegmentCount": len(normal_rows),
@@ -159,71 +162,35 @@ def metrics(normal_rows: list[dict], all_rows: list[dict], runtime_duration: flo
         "referenceStartFrameMAE": average(reference_errors),
         "sourceStartFrameMaxError": max(source_errors) if source_errors else None,
         "referenceStartFrameMaxError": max(reference_errors) if reference_errors else None,
+        "sequenceShotIdentityAccuracy": average([1.0 if row["top1ShotIdentity"] else 0.0 for row in assignment_rows]),
+        "sequenceSourceStartFrameMAE": average(assignment_source_errors),
+        "sequenceSourceStartFrameMaxError": max(assignment_source_errors) if assignment_source_errors else None,
         "confidenceCalibration": "diagnostic_scores_included",
         "runtimeDurationSec": round(runtime_duration, 3),
     }
 
 
-def soft_monotonic_assignment(rows: list[dict]) -> dict:
-    candidates_by_row = []
-    assignment_rows = [row for row in rows if not row["microcut"]]
-    for row in assignment_rows:
-        candidates = []
-        for candidate in row["rankedCandidates"][:3]:
-            candidates.append(
-                {
-                    "referenceSegmentId": row["referenceSegmentId"],
-                    "candidateSourceSegmentId": candidate["candidateSourceSegmentId"],
-                    "candidateSourceStartFrame": int(candidate["candidateSourceStartFrame"]),
-                    "score": float(candidate["finalScore"]),
-                }
-            )
-        candidates_by_row.append(candidates)
-    if not candidates_by_row:
-        return {"selectedPairs": [], "skippedSourceSegments": [], "globalScore": 0.0}
-
-    states = []
-    for index, candidates in enumerate(candidates_by_row):
-        row_states = []
-        for candidate in candidates:
-            best_previous = None
-            if index == 0:
-                score = candidate["score"]
-                path = [candidate]
-            else:
-                for previous in states[-1]:
-                    transition = soft_order_transition_score(previous["candidate"], candidate)
-                    total = previous["score"] + candidate["score"] + transition
-                    if best_previous is None or total > best_previous["score"]:
-                        best_previous = {"score": total, "path": previous["path"]}
-                score = best_previous["score"] if best_previous else candidate["score"]
-                path = list(best_previous["path"] if best_previous else []) + [candidate]
-            row_states.append({"candidate": candidate, "score": score, "path": path})
-        states.append(row_states)
-    best = max(states[-1], key=lambda state: state["score"])
-    selected_pairs = best["path"]
-    used_segments = {pair["candidateSourceSegmentId"] for pair in selected_pairs}
-    seen_segments = {
-        candidate["candidateSourceSegmentId"]
-        for candidates in candidates_by_row
-        for candidate in candidates
-    }
-    return {
-        "selectedPairs": selected_pairs,
-        "skippedSourceSegments": sorted(seen_segments - used_segments),
-        "globalScore": round(best["score"] / max(1, len(selected_pairs)), 6),
-    }
-
-
-def soft_order_transition_score(previous: dict, candidate: dict) -> float:
-    previous_start = int(previous["candidateSourceStartFrame"])
-    current_start = int(candidate["candidateSourceStartFrame"])
-    if current_start >= previous_start:
-        return 0.02
-    backward_jump = previous_start - current_start
-    if backward_jump <= 45:
-        return -0.02
-    return -min(0.18, backward_jump / 5000.0)
+def sequence_assignment_rows(normal_rows: list[dict], assignment: dict) -> list[dict]:
+    pair_by_reference = {pair["referenceSegmentId"]: pair for pair in assignment.get("selectedPairs", [])}
+    rows = []
+    for row in normal_rows:
+        pair = pair_by_reference.get(row["referenceSegmentId"])
+        if pair is None:
+            continue
+        selected_segment = pair["candidateSourceSegmentId"]
+        selected_source_start = int(pair["candidateSourceStartFrame"])
+        expected_segment = row["expectedCandidateSourceSegmentId"]
+        expected_source_start = row["expectedSourceStartFrame"]
+        rows.append(
+            {
+                **row,
+                "selectedCandidateSourceSegmentId": selected_segment,
+                "selectedSourceStartFrame": selected_source_start,
+                "top1ShotIdentity": bool(expected_segment and selected_segment == expected_segment),
+                "sourceStartFrameAbsError": abs(selected_source_start - expected_source_start) if expected_source_start is not None else None,
+            }
+        )
+    return rows
 
 
 def average(values: list[float]) -> float | None:

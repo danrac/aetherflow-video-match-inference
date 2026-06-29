@@ -15,6 +15,7 @@ from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCa
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
+from aetherflow_video_match_inference.sequence_assignment import assign_ranked_reference_sequence
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
 FULL_EVAL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-edge-case-full-eval.py"
@@ -148,6 +149,26 @@ class FeatureMatchingTests(unittest.TestCase):
 
             self.assertEqual(report["inputs"][0]["name"], "features")
             self.assertEqual(report["outputs"][0]["name"], "scores")
+
+    def test_sequence_assignment_penalizes_overlapping_source_reuse(self) -> None:
+        rows = [
+            sequence_row("reference-a", [sequence_candidate("source-a", 100, 160, 0.91)]),
+            sequence_row("reference-b", [sequence_candidate("source-b", 300, 360, 0.90)]),
+            sequence_row(
+                "reference-c",
+                [
+                    sequence_candidate("source-b", 330, 390, 0.92),
+                    sequence_candidate("source-c", 500, 560, 0.89),
+                ],
+            ),
+        ]
+
+        assignment = assign_ranked_reference_sequence(rows, top_n=2)
+
+        selected = assignment["selectedPairs"]
+        self.assertEqual(selected[0]["candidateSourceSegmentId"], "source-a")
+        self.assertEqual(selected[1]["candidateSourceSegmentId"], "source-b")
+        self.assertEqual(selected[2]["candidateSourceSegmentId"], "source-c")
 
     def test_v3_feature_distance_uses_scene_and_flow_stats(self) -> None:
         reference = {
@@ -1151,6 +1172,23 @@ def validate_schema_subset(document, schema: dict, path: str = "$") -> list[str]
         if schema.get("exclusiveMinimum") is not None and document <= schema["exclusiveMinimum"]:
             errors.append(f"{path}: expected > {schema['exclusiveMinimum']}")
     return errors
+
+
+def sequence_row(reference_id: str, candidates: list[dict]) -> dict:
+    return {
+        "referenceSegmentId": reference_id,
+        "microcut": False,
+        "rankedCandidates": candidates,
+    }
+
+
+def sequence_candidate(segment_id: str, source_in: int, source_out: int, score: float) -> dict:
+    return {
+        "candidateSourceSegmentId": segment_id,
+        "candidateSourceStartFrame": source_in,
+        "candidateSourceEndFrame": source_out,
+        "finalScore": score,
+    }
 
 
 def matches_type(value, expected_type: str) -> bool:
