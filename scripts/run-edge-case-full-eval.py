@@ -129,21 +129,24 @@ def rank_candidate_groups(reference_features: dict, candidates: list[dict], refe
             )
         combined_features = combine_feature_documents(ordered_features)
         combined_distance = color_distance(reference_features, combined_features) if combined_features is not None else None
-        parallel_features = combine_parallel_feature_documents(group_candidates) if is_parallel_contributor_group(group_candidates) else None
+        parallel_candidates = parallel_contributor_candidates(group_candidates)
+        parallel_features = combine_parallel_feature_documents(parallel_candidates) if parallel_candidates else None
+        parallel_documents = [candidate["features"] for candidate in parallel_candidates]
         parallel_distance = color_distance(reference_features, parallel_features) if parallel_features is not None else None
         panel_layout_distance = (
-            parallel_panel_layout_distance(reference_features, ordered_features)
-            if "split_screen" in reference_transform_types and is_parallel_contributor_group(group_candidates)
+            parallel_panel_layout_distance(reference_features, parallel_documents)
+            if "split_screen" in reference_transform_types and parallel_documents
             else None
         )
+        split_panel_count_penalty = split_screen_panel_count_penalty(reference_transforms, parallel_documents)
         segment_sequence_distance = (
             simple_cut_segment_sequence_distance(reference_features, ordered_features)
             if "simple_cut" in reference_transform_types and is_segment_sequence_group(ordered_features)
             else None
         )
         pip_overlay_distance = (
-            picture_in_picture_overlay_distance(reference_features, ordered_features, reference_transforms)
-            if "picture_in_picture" in reference_transform_types and is_parallel_contributor_group(group_candidates)
+            picture_in_picture_overlay_distance(reference_features, parallel_documents, reference_transforms)
+            if "picture_in_picture" in reference_transform_types and parallel_documents
             else None
         )
         spatial_distance = spatial_transform_distance(reference_features, combined_features, reference_transforms) if combined_features is not None else None
@@ -152,7 +155,7 @@ def rank_candidate_groups(reference_features: dict, candidates: list[dict], refe
         tail_distance = tail_visual_distance(reference_features, combined_features, start_fraction=0.7) if combined_features is not None else None
         group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance, spatial_distance, pip_overlay_distance)
         clip_ids = sorted({item["clip_id"] for item in scored_windows})
-        family_penalty = candidate_family_penalty(ordered_features, reference_transform_types)
+        family_penalty = candidate_family_penalty(ordered_features, reference_transform_types) + split_panel_count_penalty
         ranked.append(
             {
                 "candidate_id": group_id,
@@ -176,13 +179,37 @@ def combine_feature_documents(feature_documents: list[dict]) -> dict | None:
     return {"features": frames, "temporal_signature": binned_temporal_signature(frames, bins=8)}
 
 
-def is_parallel_contributor_group(candidates: list[dict]) -> bool:
-    roles = [
-        str(candidate.get("source_window_entry", {}).get("role", ""))
-        for candidate in candidates
-        if isinstance(candidate.get("source_window_entry"), dict)
-    ]
-    return bool(roles) and all(role.startswith("contributor-") for role in roles)
+def is_parallel_contributor_group(feature_documents: list[dict]) -> bool:
+    return bool(parallel_contributor_documents(feature_documents))
+
+
+def parallel_contributor_candidates(candidates: list[dict]) -> list[dict]:
+    contributors = []
+    for candidate in candidates:
+        entry = candidate.get("source_window_entry") if isinstance(candidate.get("source_window_entry"), dict) else {}
+        role = str(entry.get("role", ""))
+        if role.startswith("contributor-"):
+            contributors.append((contributor_role_index(role), candidate))
+    contributors.sort(key=lambda item: item[0])
+    return [candidate for _, candidate in contributors] if len(contributors) >= 2 else []
+
+
+def parallel_contributor_documents(feature_documents: list[dict]) -> list[dict]:
+    contributors = []
+    for document in feature_documents:
+        entry = document.get("source_window_entry") if isinstance(document.get("source_window_entry"), dict) else {}
+        role = str(entry.get("role", ""))
+        if role.startswith("contributor-"):
+            contributors.append((contributor_role_index(role), document))
+    contributors.sort(key=lambda item: item[0])
+    return [document for _, document in contributors] if len(contributors) >= 2 else []
+
+
+def contributor_role_index(role: str) -> int:
+    try:
+        return int(role.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return 999
 
 
 def is_segment_sequence_group(feature_documents: list[dict]) -> bool:
@@ -197,9 +224,26 @@ def is_segment_sequence_group(feature_documents: list[dict]) -> bool:
 def candidate_family_penalty(feature_documents: list[dict], reference_transform_types: set[str]) -> float:
     if "simple_cut" in reference_transform_types and not is_segment_sequence_group(feature_documents):
         return 1000.0
-    if "split_screen" in reference_transform_types and not is_parallel_contributor_group(feature_documents):
+    if "split_screen" in reference_transform_types and not parallel_contributor_documents(feature_documents):
         return 1000.0
     return 0.0
+
+
+def split_screen_panel_count_penalty(transforms: list[dict], parallel_documents: list[dict]) -> float:
+    expected_count = split_screen_panel_count(transforms)
+    if expected_count is None or not parallel_documents:
+        return 0.0
+    return 0.0 if len(parallel_documents) == expected_count else 1000.0
+
+
+def split_screen_panel_count(transforms: list[dict]) -> int | None:
+    transform = next((transform for transform in transforms if transform.get("type") == "split_screen"), None)
+    parameters = transform.get("parameters") if isinstance(transform, dict) and isinstance(transform.get("parameters"), dict) else {}
+    try:
+        panel_count = int(parameters.get("panels"))
+    except (TypeError, ValueError):
+        return None
+    return panel_count if panel_count >= 2 else None
 
 
 def simple_cut_segment_sequence_distance(reference_features: dict, feature_documents: list[dict]) -> float | None:
@@ -351,23 +395,67 @@ def parallel_panel_layout_distance(reference_features: dict, feature_documents: 
     frame_count = min(len(reference_frames), *(len(frames) for frames in panel_frames))
     distances = []
     for frame_index in range(frame_count):
-        reference_grid = reference_frames[frame_index].get("grid_mean_rgb")
-        if not isinstance(reference_grid, list) or len(reference_grid) != 9:
+        reference_grid = frame_grid_mean_rgb(reference_frames[frame_index])
+        grid_size = square_grid_size_from_raw(reference_grid)
+        if reference_grid is None or grid_size is None:
+            continue
+        reference_cells = raw_grid_to_tuples(reference_grid)
+        if len(reference_cells) != len(reference_grid):
             continue
         for panel_index, frames in enumerate(panel_frames):
-            panel_grid = frames[frame_index].get("grid_mean_rgb")
-            if not isinstance(panel_grid, list) or len(panel_grid) != 9:
+            panel_grid = frame_grid_mean_rgb(frames[frame_index])
+            if panel_grid is None or len(panel_grid) != len(reference_grid):
                 continue
-            reference_column = panel_index if panel_count == 3 else (0 if panel_index == 0 else 2)
-            for row in range(3):
-                reference_cell = reference_grid[row * 3 + reference_column]
-                panel_cell = panel_grid[row * 3 + 1]
-                if not isinstance(reference_cell, list) or not isinstance(panel_cell, list):
-                    continue
-                distances.append(sqrt(sum((float(reference_cell[channel]) - float(panel_cell[channel])) ** 2 for channel in range(3))))
+            panel_cells = raw_grid_to_tuples(panel_grid)
+            if len(panel_cells) != len(panel_grid):
+                continue
+            if grid_size == 3:
+                reference_column = panel_index if panel_count == 3 else (0 if panel_index == 0 else 2)
+                for row in range(3):
+                    reference_cell = reference_cells[row * 3 + reference_column]
+                    panel_cell = panel_cells[row * 3 + 1]
+                    distances.append(sqrt(sum((float(reference_cell[channel]) - float(panel_cell[channel])) ** 2 for channel in range(3))))
+                continue
+            panel_x0 = panel_index / panel_count
+            panel_x1 = (panel_index + 1) / panel_count
+            for row in range(grid_size):
+                for column in range(grid_size):
+                    cell_x0 = column / grid_size
+                    cell_x1 = (column + 1) / grid_size
+                    cell_y0 = row / grid_size
+                    cell_y1 = (row + 1) / grid_size
+                    overlap = rect_intersection((cell_x0, cell_y0, cell_x1, cell_y1), (panel_x0, 0.0, panel_x1, 1.0))
+                    if overlap is None:
+                        continue
+                    reference_cell = reference_cells[row * grid_size + column]
+                    panel_cell = sample_grid_region(
+                        panel_cells,
+                        grid_size,
+                        (overlap[0] - panel_x0) / (panel_x1 - panel_x0),
+                        overlap[1],
+                        (overlap[2] - panel_x0) / (panel_x1 - panel_x0),
+                        overlap[3],
+                    )
+                    distances.append(sqrt(sum((float(reference_cell[channel]) - float(panel_cell[channel])) ** 2 for channel in range(3))))
     if not distances:
         return None
-    return average(distances)
+    return average(distances) * 0.2
+
+
+def frame_grid_mean_rgb(frame: dict) -> list | None:
+    grid = frame.get("grid_mean_rgb_5x5") or frame.get("grid_mean_rgb")
+    return grid if isinstance(grid, list) else None
+
+
+def square_grid_size_from_raw(grid: list | None) -> int | None:
+    if not isinstance(grid, list):
+        return None
+    size = round(sqrt(len(grid)))
+    return size if size > 0 and size * size == len(grid) else None
+
+
+def raw_grid_to_tuples(grid: list) -> list[tuple[float, float, float]]:
+    return [tuple(float(value) for value in cell) for cell in grid if isinstance(cell, list) and len(cell) == 3]
 
 
 def spatial_transform_distance(reference_features: dict, source_features: dict, transforms: list[dict]) -> float | None:
