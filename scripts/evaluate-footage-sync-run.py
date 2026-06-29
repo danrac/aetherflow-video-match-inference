@@ -21,7 +21,7 @@ def main() -> int:
 
     run_dir = Path(args.run_dir)
     comparison_path = Path(args.fixture_comparison) if args.fixture_comparison else run_dir / "footage_sync_fixture_comparison.json"
-    expected_by_reference = load_expected_by_reference(comparison_path)
+    expected_rows = load_expected_rows(comparison_path)
     started = time.time()
     rows = []
     selected_pairs = []
@@ -37,7 +37,7 @@ def main() -> int:
         microcut = reference_end - reference_start <= 2
         result = match_source_windows(request)
         ranked = result.get("diagnostics", {}).get("rankedCandidates", [])
-        expected = expected_by_reference.get(reference_start)
+        expected = expected_for_reference(expected_rows, reference_start)
         expected_segment = expected_segment_for_request(request_doc, expected["sourceStartFrame"]) if expected else None
         selected = ranked[0] if ranked else None
         top_segments = [row["candidateSourceSegmentId"] for row in ranked[:3]]
@@ -75,6 +75,7 @@ def main() -> int:
             )
 
     normal_rows = [row for row in rows if not row["microcut"] and row["expectedCandidateSourceSegmentId"]]
+    assignment = soft_monotonic_assignment(rows)
     report = {
         "schemaVersion": "1.0.0",
         "kind": "aetherflowVideoMatchFixtureEvaluation",
@@ -92,12 +93,13 @@ def main() -> int:
             if row["microcut"]
         ],
         "globalAssignmentDiagnostics": {
-            "assignmentMethod": "per_reference_with_ranked_candidates_for_monotonic_dp_handoff",
+            "assignmentMethod": "soft_monotonic_dp_diagnostic",
             "skippedReferenceSegments": skipped_references,
-            "skippedSourceSegments": [],
-            "selectedPairs": selected_pairs,
-            "globalScore": round(sum(pair["score"] for pair in selected_pairs) / len(selected_pairs), 6) if selected_pairs else 0.0,
-            "confidenceCalibrationNotes": "Media-window rescoring lowers confidence for visually plausible hard negatives; microcuts are flagged separately.",
+            "skippedSourceSegments": assignment["skippedSourceSegments"],
+            "selectedPairs": assignment["selectedPairs"],
+            "localTop1Pairs": selected_pairs,
+            "globalScore": assignment["globalScore"],
+            "confidenceCalibrationNotes": "Soft order assignment is diagnostic only for this fixture because detected stringout segments may be shuffled or merged. Use selectedPairs as a CEP handoff candidate, not as a forced replacement yet.",
         },
         "results": rows,
     }
@@ -108,18 +110,30 @@ def main() -> int:
     return 0
 
 
-def load_expected_by_reference(path: Path) -> dict[int, dict]:
+def load_expected_rows(path: Path) -> list[dict]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    expected = {}
+    expected = []
     for item in data.get("comparisons", []):
         exp = item.get("expected") if isinstance(item, dict) else None
         if not isinstance(exp, dict):
             continue
-        expected[int(exp["referenceStartFrame"])] = {
+        expected.append({
             "sourceStartFrame": int(exp["sourceStartFrame"]),
             "referenceStartFrame": int(exp["referenceStartFrame"]),
-        }
-    return expected
+        })
+    return sorted(expected, key=lambda row: row["referenceStartFrame"])
+
+
+def expected_for_reference(expected_rows: list[dict], reference_start: int) -> dict | None:
+    if not expected_rows:
+        return None
+    exact = [row for row in expected_rows if row["referenceStartFrame"] == reference_start]
+    if exact:
+        return exact[0]
+    nearby = [row for row in expected_rows if abs(row["referenceStartFrame"] - reference_start) <= 2]
+    if nearby:
+        return sorted(nearby, key=lambda row: (abs(row["referenceStartFrame"] - reference_start), row["referenceStartFrame"]))[0]
+    return None
 
 
 def expected_segment_for_request(request_doc: dict, expected_source_start: int) -> str | None:
@@ -148,6 +162,68 @@ def metrics(normal_rows: list[dict], all_rows: list[dict], runtime_duration: flo
         "confidenceCalibration": "diagnostic_scores_included",
         "runtimeDurationSec": round(runtime_duration, 3),
     }
+
+
+def soft_monotonic_assignment(rows: list[dict]) -> dict:
+    candidates_by_row = []
+    assignment_rows = [row for row in rows if not row["microcut"]]
+    for row in assignment_rows:
+        candidates = []
+        for candidate in row["rankedCandidates"][:3]:
+            candidates.append(
+                {
+                    "referenceSegmentId": row["referenceSegmentId"],
+                    "candidateSourceSegmentId": candidate["candidateSourceSegmentId"],
+                    "candidateSourceStartFrame": int(candidate["candidateSourceStartFrame"]),
+                    "score": float(candidate["finalScore"]),
+                }
+            )
+        candidates_by_row.append(candidates)
+    if not candidates_by_row:
+        return {"selectedPairs": [], "skippedSourceSegments": [], "globalScore": 0.0}
+
+    states = []
+    for index, candidates in enumerate(candidates_by_row):
+        row_states = []
+        for candidate in candidates:
+            best_previous = None
+            if index == 0:
+                score = candidate["score"]
+                path = [candidate]
+            else:
+                for previous in states[-1]:
+                    transition = soft_order_transition_score(previous["candidate"], candidate)
+                    total = previous["score"] + candidate["score"] + transition
+                    if best_previous is None or total > best_previous["score"]:
+                        best_previous = {"score": total, "path": previous["path"]}
+                score = best_previous["score"] if best_previous else candidate["score"]
+                path = list(best_previous["path"] if best_previous else []) + [candidate]
+            row_states.append({"candidate": candidate, "score": score, "path": path})
+        states.append(row_states)
+    best = max(states[-1], key=lambda state: state["score"])
+    selected_pairs = best["path"]
+    used_segments = {pair["candidateSourceSegmentId"] for pair in selected_pairs}
+    seen_segments = {
+        candidate["candidateSourceSegmentId"]
+        for candidates in candidates_by_row
+        for candidate in candidates
+    }
+    return {
+        "selectedPairs": selected_pairs,
+        "skippedSourceSegments": sorted(seen_segments - used_segments),
+        "globalScore": round(best["score"] / max(1, len(selected_pairs)), 6),
+    }
+
+
+def soft_order_transition_score(previous: dict, candidate: dict) -> float:
+    previous_start = int(previous["candidateSourceStartFrame"])
+    current_start = int(candidate["candidateSourceStartFrame"])
+    if current_start >= previous_start:
+        return 0.02
+    backward_jump = previous_start - current_start
+    if backward_jump <= 45:
+        return -0.02
+    return -min(0.18, backward_jump / 5000.0)
 
 
 def average(values: list[float]) -> float | None:

@@ -82,7 +82,7 @@ def media_window_rescore(reference_path: str, reference_features: dict[str, Any]
 def sample_relative_frames(duration: int) -> list[int]:
     if duration <= 1:
         return [0]
-    fractions = (0.25, 0.75)
+    fractions = (0.5,)
     return sorted({max(0, min(duration - 1, int(round((duration - 1) * fraction)))) for fraction in fractions})
 
 
@@ -108,7 +108,8 @@ def candidate_start_grid(source_in: int, max_start: int, rel_frames: list[int], 
             value = center + delta
             if source_in <= value <= max_start:
                 refined.add(value)
-    return sorted(refined)[:12]
+    midpoint = source_in + (max_start - source_in) // 2
+    return sorted(refined, key=lambda value: (abs(value - midpoint), value))[:10]
 
 
 def score_candidate_start(source_path: str, start_frame: int, rel_frames: list[int], fps: float, reference_arrays: list[Any], np: Any, ImageOps: Any) -> float | None:
