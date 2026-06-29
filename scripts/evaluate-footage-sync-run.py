@@ -19,6 +19,7 @@ def main() -> int:
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--fixture-comparison")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--source-start-model")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -79,7 +80,8 @@ def main() -> int:
 
     normal_rows = [row for row in rows if not row["microcut"] and row["expectedCandidateSourceSegmentId"]]
     assignment = assign_ranked_reference_sequence(rows)
-    assignment = refine_sequence_assignment(run_dir, rows, assignment)
+    source_start_model = load_optional_json(args.source_start_model)
+    assignment = refine_sequence_assignment(run_dir, rows, assignment, source_start_model)
     report_rows = [report_row(row) for row in rows]
     report = {
         "schemaVersion": "1.0.0",
@@ -197,7 +199,7 @@ def sequence_assignment_rows(normal_rows: list[dict], assignment: dict) -> list[
     return rows
 
 
-def refine_sequence_assignment(run_dir: Path, rows: list[dict], assignment: dict) -> dict:
+def refine_sequence_assignment(run_dir: Path, rows: list[dict], assignment: dict, source_start_model: dict | None = None) -> dict:
     try:
         from PIL import Image, ImageOps
         import numpy as np
@@ -252,41 +254,63 @@ def refine_sequence_assignment(run_dir: Path, rows: list[dict], assignment: dict
                     refined_pair["handlePrior"] = "singleton_handle_window"
                     refined_pair["candidateSourceStartFrame"] = int(prior_start)
                     refined_pair["candidateSourceEndFrame"] = min(source_out, int(prior_start) + reference_duration)
-            if source_duration < reference_duration * 1.5:
-                break
             max_start = max(source_in, source_out - reference_duration)
-            refined = refine_boundary_start(
-                request.reference_path,
-                reference_doc,
-                candidate,
-                source_in,
-                max_start,
-                reference_start,
-                reference_duration,
-                reference_fps,
-                source_fps,
-                np,
-                Image,
-                ImageOps,
-                baseline_start=int(refined_pair["candidateSourceStartFrame"]),
-            )
-            baseline_distance = refined.get("baseline_distance") if refined is not None else None
-            boundary_distance = refined.get("distance") if refined is not None else None
-            improvement = float(baseline_distance) - float(boundary_distance) if baseline_distance is not None and boundary_distance is not None else 0.0
-            if refined is not None and improvement >= 2.0:
-                refined_pair["identitySourceStartFrame"] = refined_pair["candidateSourceStartFrame"]
-                refined_pair["identitySourceEndFrame"] = refined_pair["candidateSourceEndFrame"]
-                refined_pair["boundaryDistance"] = refined["distance"]
-                refined_pair["boundaryBaselineDistance"] = baseline_distance
-                refined_pair["candidateSourceStartFrame"] = int(refined["source_in"])
-                refined_pair["candidateSourceEndFrame"] = min(source_out, int(refined["source_in"]) + reference_duration)
-            if singleton_segment and handle_slack / max(1, reference_duration) >= 1.0:
-                prior_start = max(source_in, min(max(source_in, source_out - reference_duration), source_in + round(handle_slack * 0.5)))
-                refined_pair["identitySourceStartFrame"] = refined_pair.get("identitySourceStartFrame", refined_pair["candidateSourceStartFrame"])
-                refined_pair["identitySourceEndFrame"] = refined_pair.get("identitySourceEndFrame", refined_pair["candidateSourceEndFrame"])
-                refined_pair["handlePrior"] = "singleton_large_handle_center"
-                refined_pair["candidateSourceStartFrame"] = int(prior_start)
-                refined_pair["candidateSourceEndFrame"] = min(source_out, int(prior_start) + reference_duration)
+            if source_duration >= reference_duration * 1.5:
+                refined = refine_boundary_start(
+                    request.reference_path,
+                    reference_doc,
+                    candidate,
+                    source_in,
+                    max_start,
+                    reference_start,
+                    reference_duration,
+                    reference_fps,
+                    source_fps,
+                    np,
+                    Image,
+                    ImageOps,
+                    baseline_start=int(refined_pair["candidateSourceStartFrame"]),
+                )
+                baseline_distance = refined.get("baseline_distance") if refined is not None else None
+                boundary_distance = refined.get("distance") if refined is not None else None
+                improvement = float(baseline_distance) - float(boundary_distance) if baseline_distance is not None and boundary_distance is not None else 0.0
+                if refined is not None and improvement >= 2.0:
+                    refined_pair["identitySourceStartFrame"] = refined_pair["candidateSourceStartFrame"]
+                    refined_pair["identitySourceEndFrame"] = refined_pair["candidateSourceEndFrame"]
+                    refined_pair["boundaryDistance"] = refined["distance"]
+                    refined_pair["boundaryBaselineDistance"] = baseline_distance
+                    refined_pair["candidateSourceStartFrame"] = int(refined["source_in"])
+                    refined_pair["candidateSourceEndFrame"] = min(source_out, int(refined["source_in"]) + reference_duration)
+                if singleton_segment and handle_slack / max(1, reference_duration) >= 1.0:
+                    prior_start = max(source_in, min(max_start, source_in + round(handle_slack * 0.5)))
+                    refined_pair["identitySourceStartFrame"] = refined_pair.get("identitySourceStartFrame", refined_pair["candidateSourceStartFrame"])
+                    refined_pair["identitySourceEndFrame"] = refined_pair.get("identitySourceEndFrame", refined_pair["candidateSourceEndFrame"])
+                    refined_pair["handlePrior"] = "singleton_large_handle_center"
+                    refined_pair["candidateSourceStartFrame"] = int(prior_start)
+                    refined_pair["candidateSourceEndFrame"] = min(source_out, int(prior_start) + reference_duration)
+            if source_start_model is not None:
+                model_start = predict_source_start_with_model(
+                    source_start_model,
+                    reference_duration,
+                    source_in,
+                    source_out,
+                    refined_pair,
+                    singleton_segment,
+                )
+                should_use_model = (
+                    refined_pair.get("handlePrior") == "singleton_large_handle_center"
+                    or (
+                        refined_pair.get("handlePrior") is None
+                        and singleton_segment
+                        and handle_slack > 0
+                        and handle_slack / max(1, reference_duration) <= 0.25
+                    )
+                )
+                if model_start is not None and should_use_model:
+                    refined_pair["modelSourceStartFrame"] = int(model_start)
+                    refined_pair["modelId"] = source_start_model.get("model_id")
+                    refined_pair["candidateSourceStartFrame"] = int(model_start)
+                    refined_pair["candidateSourceEndFrame"] = min(source_out, int(model_start) + reference_duration)
             break
         refined_pairs.append(refined_pair)
     updated = dict(assignment)
@@ -297,6 +321,62 @@ def refine_sequence_assignment(run_dir: Path, rows: list[dict], assignment: dict
 
 def report_row(row: dict) -> dict:
     return {key: value for key, value in row.items() if not key.startswith("_")}
+
+
+def predict_source_start_with_model(model: dict, reference_duration: int, source_in: int, source_out: int, pair: dict, singleton_segment: bool) -> int | None:
+    feature_names = model.get("feature_names")
+    weights = model.get("weights")
+    if not isinstance(feature_names, list) or not isinstance(weights, list) or len(feature_names) != len(weights):
+        return None
+    source_duration = max(1, source_out - source_in)
+    slack = max(0, source_duration - reference_duration)
+    identity_start = int(pair["identitySourceStartFrame"]) if pair.get("identitySourceStartFrame") is not None else source_in
+    boundary_start = int(pair.get("candidateSourceStartFrame", identity_start))
+    small_prior = round(slack * 0.67) if slack / max(1, reference_duration) <= 0.5 else round(slack * 0.5)
+    center_prior = round(slack * 0.5)
+    tail_prior = slack
+    tail_trimmed_prior = max(0, slack - round(slack * 0.15))
+    short_handle = slack / max(1, reference_duration) <= 0.25
+    short_handle_tail_prior = tail_trimmed_prior if short_handle else 0
+    features = {
+        "bias": 1.0,
+        "reference_duration": reference_duration / 300.0,
+        "source_duration": source_duration / 600.0,
+        "handle_slack": slack / 300.0,
+        "handle_slack_ratio": slack / max(1, reference_duration),
+        "identity_offset": (identity_start - source_in) / 300.0,
+        "boundary_offset": (boundary_start - source_in) / 300.0,
+        "small_handle_prior_offset": small_prior / 300.0,
+        "center_prior_offset": center_prior / 300.0,
+        "tail_prior_offset": tail_prior / 300.0,
+        "tail_trimmed_prior_offset": tail_trimmed_prior / 300.0,
+        "short_handle_tail_prior_offset": short_handle_tail_prior / 300.0,
+        "short_handle_tail_bias": 1.0 if short_handle else 0.0,
+        "identity_boundary_delta": (boundary_start - identity_start) / 300.0,
+        "singleton_segment": 1.0 if singleton_segment else 0.0,
+    }
+    ratio = float(features["handle_slack_ratio"])
+    features["handle_slack_ratio_squared"] = ratio * ratio
+    features["boundary_offset_x_handle_ratio"] = float(features["boundary_offset"]) * ratio
+    features["identity_offset_x_handle_ratio"] = float(features["identity_offset"]) * ratio
+    features["small_prior_x_handle_ratio"] = float(features["small_handle_prior_offset"]) * ratio
+    features["center_prior_x_handle_ratio"] = float(features["center_prior_offset"]) * ratio
+    features["tail_prior_x_handle_ratio"] = float(features["tail_prior_offset"]) * ratio
+    features["tail_trimmed_prior_x_handle_ratio"] = float(features["tail_trimmed_prior_offset"]) * ratio
+    features["short_handle_tail_prior_x_handle_ratio"] = float(features["short_handle_tail_prior_offset"]) * ratio
+    value = 0.0
+    for index, name in enumerate(feature_names):
+        value += float(weights[index]) * float(features.get(str(name), 0.0))
+    offset = max(0, min(slack, round(value * 300.0)))
+    return max(source_in, min(max(source_in, source_out - reference_duration), source_in + offset))
+
+
+def load_optional_json(path: str | None) -> dict | None:
+    if not path:
+        return None
+    with Path(path).open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    return data if isinstance(data, dict) else None
 
 
 def average(values: list[float]) -> float | None:
