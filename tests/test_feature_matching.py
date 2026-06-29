@@ -17,6 +17,7 @@ from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
 FULL_EVAL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-edge-case-full-eval.py"
+REQUEST_BUILDER_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build-source-window-match-request.py"
 
 
 class FeatureMatchingTests(unittest.TestCase):
@@ -365,6 +366,74 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(cep_json["timeline"]["layers"][0]["operation"], "source_window_reranker_match")
             self.assertEqual(cep_json["timeline"]["layers"][0]["parameters"]["candidate_group_id"], "edit-001")
 
+    def test_request_builder_creates_cli_compatible_source_window_request(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-request-builder-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source_features = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            ground_truth = root / "ground_truth.json"
+            write_json(
+                ground_truth,
+                {
+                    "schema_version": "0.1.0",
+                    "sample_id": "sample-a",
+                    "reference": {"path": "reference.mp4", "fps": 24.0, "duration_frames": 24},
+                    "segments": [
+                        {
+                            "segment_id": "segment-a",
+                            "source_clip_id": "clip-a",
+                            "reference_in": 0,
+                            "reference_out": 24,
+                            "source_in": 3,
+                            "source_out": 27,
+                            "confidence_label": 1.0,
+                            "transforms": [{"type": "simple_cut", "parameters": {}}],
+                        }
+                    ],
+                },
+            )
+            manifest = root / "dataset_manifest.json"
+            write_json(
+                manifest,
+                {
+                    "schema_version": "0.1.0",
+                    "dataset_id": "test",
+                    "dataset_version": "v0001",
+                    "created_at": "2026-06-29T00:00:00+00:00",
+                    "clips": [{"clip_id": "clip-a", "path": "/tmp/a.mp4", "duration_frames": 24, "fps": 24.0, "checksum": "abc"}],
+                    "samples": [
+                        {
+                            "sample_id": "sample-a",
+                            "reference_path": "reference.mp4",
+                            "reference_feature_manifest": reference_features.name,
+                            "ground_truth_path": ground_truth.name,
+                            "source_window_feature_manifests": [
+                                {
+                                    "path": source_features.name,
+                                    "source_clip_id": "clip-a",
+                                    "source_in": 3,
+                                    "source_out": 27,
+                                    "role": "segment",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            request_path = root / "request.json"
+            output_path = root / "match.json"
+            builder = load_request_builder_script()
+
+            exit_code = builder.main(["--dataset-manifest", str(manifest), "--sample-id", "sample-a", "--model-manifest", str(model_manifest), "--output", str(request_path)])
+            cli_exit_code = cli_main(["match-source-windows", "--request", str(request_path), "--output", str(output_path)])
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(cli_exit_code, 0)
+            self.assertEqual(result["matches"][0]["source_in"], 3)
+            self.assertEqual(result["matches"][0]["reconstruction"]["parameters"]["transforms"][0]["type"], "simple_cut")
+
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
             model_manifest = write_model_manifest(Path(temp_dir))
@@ -542,6 +611,15 @@ def load_full_eval_script():
     spec = importlib.util.spec_from_file_location("aetherflow_full_eval_test_module", FULL_EVAL_SCRIPT)
     if spec is None or spec.loader is None:
         raise RuntimeError("could not load full eval script")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_request_builder_script():
+    spec = importlib.util.spec_from_file_location("aetherflow_request_builder_test_module", REQUEST_BUILDER_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load request builder script")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
