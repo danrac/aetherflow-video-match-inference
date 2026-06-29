@@ -35,6 +35,13 @@ def main(argv: list[str]) -> int:
     dataset_manifest = Path(argv[1]) if len(argv) > 1 else DEFAULT_DATASET
     output_path = Path(argv[2]) if len(argv) > 2 else DEFAULT_OUTPUT
     reranker_model = load_reranker_model(argv[3]) if len(argv) > 3 else None
+    component_cache_path = Path(argv[4]) if len(argv) > 4 else None
+    if component_cache_path:
+        report = evaluate_component_cache(dataset_manifest, component_cache_path, reranker_model)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(output_path)
+        return 0
     root = dataset_manifest.parent
     dataset = load_json(dataset_manifest)
     candidate_features = load_source_window_candidates(root, dataset)
@@ -84,6 +91,63 @@ def main(argv: list[str]) -> int:
     output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(output_path)
     return 0
+
+
+def evaluate_component_cache(dataset_manifest: Path, component_cache_path: Path, reranker_model: dict | None) -> dict:
+    cache = load_json(component_cache_path)
+    if cache.get("feature_names") != FEATURE_NAMES:
+        raise ValueError(f"component cache {component_cache_path} has incompatible feature_names")
+    results = []
+    for sample in cache.get("samples", []):
+        expected_clip_ids = set(str(value) for value in sample.get("expected_clip_ids", []))
+        transform_types = set(str(value) for value in sample.get("transform_types", []))
+        ranked = []
+        for candidate in sample.get("candidates", []):
+            baseline_distance = float(candidate.get("baseline_distance", float("inf")))
+            if reranker_model is not None and use_learned_reranker(transform_types, reranker_model):
+                distance = linear_reranker_score(candidate.get("features", []), reranker_model)
+            else:
+                distance = baseline_distance
+            ranked.append(
+                {
+                    "candidate_id": candidate.get("candidate_id"),
+                    "clip_id": candidate.get("clip_id"),
+                    "clip_ids": candidate.get("clip_ids", []),
+                    "distance": round(distance, 6) if distance != float("inf") else float("inf"),
+                    "window_count": candidate.get("window_count", 1),
+                }
+            )
+        ranked = sorted(ranked, key=lambda item: (float(item["distance"]), str(item["candidate_id"])))
+        expected_ranks = [index + 1 for index, candidate in enumerate(ranked) if ranked_item_matches_expected(candidate, expected_clip_ids)]
+        if not expected_ranks:
+            continue
+        best_rank = min(expected_ranks)
+        top_candidate = ranked[0]
+        results.append(
+            {
+                "sample_id": sample.get("sample_id"),
+                "transform_types": sorted(transform_types),
+                "expected_clip_ids": sorted(expected_clip_ids),
+                "best_expected_rank": best_rank,
+                "top_candidate_id": top_candidate["candidate_id"],
+                "top_clip_id": top_candidate["clip_id"],
+                "top_candidate_clip_ids": top_candidate.get("clip_ids", []),
+                "top_candidate_window_count": top_candidate.get("window_count", 1),
+                "top_distance": top_candidate["distance"],
+                "top1_correct": best_rank == 1,
+                "top5_correct": best_rank <= 5,
+                "top10_correct": best_rank <= 10,
+            }
+        )
+    return {
+        "dataset_manifest": str(dataset_manifest),
+        "component_cache_path": str(component_cache_path),
+        "candidate_count": int(cache.get("source_candidate_count", 0)),
+        "reranker_model": reranker_model_summary(reranker_model),
+        "metrics": metrics(results),
+        "breakdown_by_transform": breakdown_by_transform(results),
+        "results": results,
+    }
 
 
 def load_source_window_candidates(root: Path, dataset: dict) -> list[dict]:
@@ -1003,7 +1067,11 @@ def reranker_distance(components: dict, transform_types: set[str], baseline_dist
     if model is None or not use_learned_reranker(transform_types, model):
         return baseline_distance
     features = normalize_components(components)
-    return sum(float(model["weights"][index]) * features[index] for index in range(len(FEATURE_NAMES))) + float(model.get("bias", 0.0))
+    return linear_reranker_score(features, model)
+
+
+def linear_reranker_score(features: list[float], model: dict) -> float:
+    return sum(float(model["weights"][index]) * features[index] for index in range(min(len(features), len(FEATURE_NAMES)))) + float(model.get("bias", 0.0))
 
 
 def use_learned_reranker(transform_types: set[str], model: dict) -> bool:

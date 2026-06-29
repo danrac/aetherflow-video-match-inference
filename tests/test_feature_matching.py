@@ -187,6 +187,61 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertEqual(scale_score, 123.0)
         self.assertEqual(split_screen_score, 123.0)
 
+    def test_full_eval_can_use_reranker_component_cache(self) -> None:
+        module = load_full_eval_script()
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-component-cache-") as temp_dir:
+            root = Path(temp_dir)
+            cache_path = root / "component_cache.json"
+            write_json(
+                cache_path,
+                {
+                    "schema_version": "0.1.0",
+                    "feature_names": module.FEATURE_NAMES,
+                    "sample_count": 1,
+                    "source_candidate_count": 2,
+                    "samples": [
+                        {
+                            "sample_id": "sample-a",
+                            "expected_clip_ids": ["clip-a"],
+                            "transform_types": ["simple_cut"],
+                            "candidates": [
+                                {
+                                    "candidate_id": "wrong",
+                                    "clip_id": "clip-b",
+                                    "clip_ids": ["clip-b"],
+                                    "baseline_distance": 0.0,
+                                    "features": [10.0] + [0.0] * 9,
+                                    "window_count": 1,
+                                },
+                                {
+                                    "candidate_id": "correct",
+                                    "clip_id": "clip-a",
+                                    "clip_ids": ["clip-a"],
+                                    "baseline_distance": 100.0,
+                                    "features": [0.0] * 10,
+                                    "window_count": 1,
+                                },
+                            ],
+                        }
+                    ],
+                },
+            )
+            model = {
+                "model_id": "test-reranker",
+                "model_version": "v0001",
+                "weights": [1.0] + [0.0] * 9,
+                "bias": 0.0,
+                "routing": {
+                    "baseline_protected_transform_types": ["scale_position"],
+                    "learned_reranker_applies_to": ["simple_cut"],
+                },
+            }
+
+            report = module.evaluate_component_cache(root / "dataset_manifest.json", cache_path, model)
+
+            self.assertEqual(report["metrics"]["top1_accuracy"], 1.0)
+            self.assertEqual(report["results"][0]["top_candidate_id"], "correct")
+
     def test_source_window_match_applies_reranker_to_simple_cut_groups(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-reranker-") as temp_dir:
             root = Path(temp_dir)
