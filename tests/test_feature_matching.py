@@ -20,6 +20,7 @@ CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
 FULL_EVAL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-edge-case-full-eval.py"
 REQUEST_BUILDER_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build-source-window-match-request.py"
 PROFILE_SMOKE_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-source-window-profile-smoke.py"
+PROFILE_SMOKE_GRID_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-source-window-profile-smoke-grid.py"
 
 
 class FeatureMatchingTests(unittest.TestCase):
@@ -571,6 +572,89 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertTrue((output_dir / "timeline.edl").exists())
             self.assertTrue((output_dir / "aetherflow_import.jsx").exists())
 
+    def test_profile_smoke_grid_runs_selected_transform_samples(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-profile-smoke-grid-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source_features = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            samples = []
+            for transform_type in ("reverse", "simple_cut"):
+                ground_truth = root / f"{transform_type}.ground_truth.json"
+                write_json(
+                    ground_truth,
+                    {
+                        "schema_version": "0.1.0",
+                        "sample_id": transform_type,
+                        "reference": {"path": "reference.mp4", "fps": 24.0, "duration_frames": 24},
+                        "segments": [
+                            {
+                                "segment_id": f"{transform_type}-segment",
+                                "source_clip_id": "clip-a",
+                                "reference_in": 0,
+                                "reference_out": 24,
+                                "source_in": 3,
+                                "source_out": 27,
+                                "confidence_label": 1.0,
+                                "transforms": [{"type": transform_type, "parameters": {}}],
+                            }
+                        ],
+                    },
+                )
+                samples.append(
+                    {
+                        "sample_id": transform_type,
+                        "reference_path": "reference.mp4",
+                        "reference_feature_manifest": reference_features.name,
+                        "ground_truth_path": ground_truth.name,
+                        "source_window_feature_manifests": [
+                            {
+                                "path": source_features.name,
+                                "source_clip_id": "clip-a",
+                                "source_in": 3,
+                                "source_out": 27,
+                                "role": "segment",
+                            }
+                        ],
+                    }
+                )
+            manifest = root / "dataset_manifest.json"
+            write_json(
+                manifest,
+                {
+                    "schema_version": "0.1.0",
+                    "dataset_id": "test",
+                    "dataset_version": "v0001",
+                    "created_at": "2026-06-29T00:00:00+00:00",
+                    "clips": [{"clip_id": "clip-a", "path": "/tmp/a.mp4", "duration_frames": 24, "fps": 24.0, "checksum": "abc"}],
+                    "samples": samples,
+                },
+            )
+            profile_path = root / "profile.json"
+            write_json(profile_path, {"model_manifest": str(model_manifest)})
+            output_dir = root / "smoke-grid"
+            smoke_grid = load_profile_smoke_grid_script()
+
+            exit_code = smoke_grid.main([
+                "--profile",
+                str(profile_path),
+                "--dataset-manifest",
+                str(manifest),
+                "--output-dir",
+                str(output_dir),
+                "--transform",
+                "reverse",
+                "--transform",
+                "simple_cut",
+            ])
+            report = json.loads((output_dir / "smoke_grid_report.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(report["executed_transform_count"], 2)
+            self.assertEqual(report["missing_transforms"], [])
+            self.assertTrue((output_dir / "reverse" / "smoke_report.json").exists())
+            self.assertTrue((output_dir / "simple_cut" / "smoke_report.json").exists())
+
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
             model_manifest = write_model_manifest(Path(temp_dir))
@@ -768,6 +852,15 @@ def load_profile_smoke_script():
     spec = importlib.util.spec_from_file_location("aetherflow_profile_smoke_test_module", PROFILE_SMOKE_SCRIPT)
     if spec is None or spec.loader is None:
         raise RuntimeError("could not load profile smoke script")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_profile_smoke_grid_script():
+    spec = importlib.util.spec_from_file_location("aetherflow_profile_smoke_grid_test_module", PROFILE_SMOKE_GRID_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("could not load profile smoke grid script")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
