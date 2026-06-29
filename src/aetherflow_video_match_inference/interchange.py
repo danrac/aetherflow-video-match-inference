@@ -173,7 +173,10 @@ def export_after_effects_extendscript(host_payload: dict, output_path: str | Pat
     app.beginUndoGroup("AetherFlow Video Match Import");
     try {{
         var payload = {payload_json};
-        var project = app.project || app.newProject();
+        if (!app.project) {{
+            app.newProject();
+        }}
+        var project = app.project;
         var compWidth = 1920;
         var compHeight = 1080;
         var pixelAspect = 1.0;

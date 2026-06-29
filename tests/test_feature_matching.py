@@ -517,6 +517,8 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertIn("00:00:05:00", edl_path.read_text(encoding="utf-8"))
             jsx = jsx_path.read_text(encoding="utf-8")
             self.assertIn("app.beginUndoGroup", jsx)
+            self.assertIn("if (!app.project)", jsx)
+            self.assertIn("var project = app.project", jsx)
             self.assertIn("project.items.addComp", jsx)
             self.assertIn("comp.layers.add", jsx)
 
