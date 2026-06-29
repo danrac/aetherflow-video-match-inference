@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from aetherflow_video_match_inference.adapters import to_host_payload
-from aetherflow_video_match_inference.engine import MatchRequest, match
+from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, match, match_source_windows
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
@@ -187,6 +187,68 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertEqual(scale_score, 123.0)
         self.assertEqual(split_screen_score, 123.0)
 
+    def test_source_window_match_applies_reranker_to_simple_cut_groups(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-reranker-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reranker_model = write_reranker_model(root / "reranker.json", bias=-3.14)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            first_segment = write_feature_manifest(root / "first-segment.features.json", "clip-a", [180.0, 10.0, 20.0], source_window={"source_in": 10, "source_out": 22})
+            second_segment = write_feature_manifest(root / "second-segment.features.json", "clip-b", [30.0, 190.0, 40.0], source_window={"source_in": 40, "source_out": 52})
+
+            result = match_source_windows(
+                SourceWindowMatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    model_manifest_path=str(model_manifest),
+                    reference_feature_manifest_path=str(reference_features),
+                    reranker_model_path=str(reranker_model),
+                    transforms=({"type": "simple_cut", "parameters": {}},),
+                    candidates=(
+                        SourceWindowCandidate("candidate-a", "edit-001", "/tmp/a.mp4", "clip-a", str(first_segment), 10, 22, role="segment"),
+                        SourceWindowCandidate("candidate-b", "edit-001", "/tmp/b.mp4", "clip-b", str(second_segment), 40, 52, role="segment"),
+                    ),
+                )
+            )
+
+            self.assertEqual(result["ranking"]["reranker_model"]["model_id"], "test-reranker")
+            self.assertEqual(result["ranking"]["top_candidates"][0]["candidate_id"], "edit-001")
+            self.assertEqual(result["ranking"]["top_candidates"][0]["distance"], -3.14)
+            self.assertEqual(result["matches"][0]["reference_in"], 0)
+            self.assertEqual(result["matches"][0]["reference_out"], 12)
+            self.assertEqual(result["matches"][1]["reference_in"], 12)
+            self.assertEqual(result["matches"][1]["reference_out"], 24)
+            self.assertLessEqual(result["matches"][0]["confidence"], 1.0)
+            self.assertEqual(result["matches"][0]["reconstruction"]["operation"], "source_window_reranker_match")
+            self.assertEqual(result["matches"][0]["reconstruction"]["parameters"]["candidate_group_id"], "edit-001")
+
+    def test_source_window_match_keeps_scale_position_on_baseline_routing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-scale-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reranker_model = write_reranker_model(root / "reranker.json", bias=-9.0)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source_features = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 5, "source_out": 29})
+
+            result = match_source_windows(
+                SourceWindowMatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    model_manifest_path=str(model_manifest),
+                    reference_feature_manifest_path=str(reference_features),
+                    reranker_model_path=str(reranker_model),
+                    transforms=(
+                        {
+                            "type": "scale_position",
+                            "parameters": {"output_width": 1920, "output_height": 1080, "width": 960, "height": 540, "x": 0, "y": 0},
+                        },
+                    ),
+                    candidates=(SourceWindowCandidate("candidate-a", "edit-001", "/tmp/a.mp4", "clip-a", str(source_features), 5, 29),),
+                )
+            )
+
+            self.assertNotEqual(result["ranking"]["top_candidates"][0]["distance"], -9.0)
+            self.assertEqual(result["matches"][0]["source_in"], 5)
+            self.assertEqual(result["matches"][0]["source_out"], 29)
+
     def test_host_payload_includes_timeline_edits(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-host-") as temp_dir:
             model_manifest = write_model_manifest(Path(temp_dir))
@@ -292,6 +354,36 @@ def write_model_manifest(root: Path) -> Path:
             },
             "trained_on_dataset": {"dataset_id": "test", "dataset_version": "v0001"},
             "metrics": {},
+        },
+    )
+    return path
+
+
+def write_reranker_model(path: Path, bias: float) -> Path:
+    write_json(
+        path,
+        {
+            "schema_version": "0.1.0",
+            "model_id": "test-reranker",
+            "model_version": "v0001",
+            "feature_names": [
+                "combined_visual",
+                "average_window",
+                "tail_visual",
+                "parallel_visual",
+                "panel_layout",
+                "segment_sequence",
+                "spatial_transform",
+                "pip_overlay",
+                "family_penalty",
+                "window_count",
+            ],
+            "weights": [0.0] * 10,
+            "bias": bias,
+            "routing": {
+                "baseline_protected_transform_types": ["crop", "letterbox", "picture_in_picture", "pillarbox", "scale_position"],
+                "learned_reranker_applies_to": ["reverse", "simple_cut"],
+            },
         },
     )
     return path
