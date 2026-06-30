@@ -6,7 +6,7 @@ from itertools import count
 from typing import Any
 
 
-def assign_ranked_reference_sequence(rows: list[dict[str, Any]], *, top_n: int = 3, beam_width: int = 128) -> dict[str, Any]:
+def assign_ranked_reference_sequence(rows: list[dict[str, Any]], *, top_n: int = 6, beam_width: int = 256) -> dict[str, Any]:
     assignment_rows = [row for row in rows if not row.get("microcut")]
     if not assignment_rows:
         return {"selectedPairs": [], "skippedSourceSegments": [], "globalScore": 0.0}
@@ -72,12 +72,8 @@ def transition_score(previous_windows: list[tuple[str, int, int]], current_windo
     score = 0.0
     if previous_windows:
         previous_segment, previous_start, _previous_end = previous_windows[-1]
-        if current_start >= previous_start:
-            score += 0.01
-        else:
-            score -= 0.04
         if current_segment == previous_segment:
-            score -= 0.03
+            score -= 0.015
     for previous_segment, previous_start, previous_end in previous_windows:
         overlap = max(0, min(previous_end, current_end) - max(previous_start, current_start))
         if overlap <= 0:

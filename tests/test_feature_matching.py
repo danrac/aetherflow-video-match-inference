@@ -422,6 +422,39 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(result["matches"][0]["source_in"], 5)
             self.assertEqual(result["matches"][0]["source_out"], 29)
 
+    def test_source_window_match_uses_reference_segment_duration_and_handle_prior(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-handle-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_features = write_feature_manifest(
+                root / "reference.features.json",
+                "reference-seg",
+                [100.0, 120.0, 140.0],
+                source_window={"source_in": 50, "source_out": 80},
+            )
+            source_features = write_feature_manifest(
+                root / "source.features.json",
+                "clip-a",
+                [101.0, 121.0, 141.0],
+                source_window={"source_in": 100, "source_out": 142},
+            )
+
+            result = match_source_windows(
+                SourceWindowMatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    model_manifest_path=str(model_manifest),
+                    reference_feature_manifest_path=str(reference_features),
+                    transforms=(),
+                    candidates=(SourceWindowCandidate("candidate-a", "edit-001", "/tmp/a.mp4", "clip-a", str(source_features), 100, 142),),
+                )
+            )
+
+            self.assertEqual(result["reference"]["duration_frames"], 30)
+            self.assertEqual(result["matches"][0]["reference_in"], 0)
+            self.assertEqual(result["matches"][0]["reference_out"], 30)
+            self.assertEqual(result["matches"][0]["source_in"], 108)
+            self.assertEqual(result["matches"][0]["source_out"], 138)
+
     def test_cli_runs_source_window_match_from_json_request(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-cli-") as temp_dir:
             root = Path(temp_dir)

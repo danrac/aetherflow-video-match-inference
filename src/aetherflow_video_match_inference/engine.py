@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .features import color_distance, confidence_from_distance, load_feature_manifest
-from .media_window import media_window_rescore
+from .media_window import media_window_rescore, refine_boundary_start
 from .reranker import load_reranker_model, rank_candidates, reranker_model_summary
 
 
@@ -164,7 +164,7 @@ def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -
 
 
 def source_window_matches_from_candidates(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], top_ranked: dict) -> list[dict]:
-    reference_duration = int(reference_features.get("duration_frames", 0) or 0)
+    reference_duration = reference_window_duration(reference_features)
     source_window_lengths = [source_window_length(candidate["features"]) for candidate in candidates]
     total_window_length = sum(source_window_lengths)
     reference_cursor = 0
@@ -185,6 +185,17 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
             reference_out = max(1, min(reference_duration or source_duration, source_duration))
         scored_window = next((item for item in top_ranked.get("window_candidates", []) if item.get("candidate_id") == candidate["candidate_id"]), None)
         window_distance = float(scored_window["distance"]) if scored_window and scored_window.get("distance") != float("inf") else float(top_ranked["distance"])
+        if scored_window:
+            source_in = int(scored_window.get("source_in", source_in))
+            source_out = int(scored_window.get("source_out", source_out))
+            source_in, source_out = refine_selected_source_window(
+                request.reference_path,
+                reference_features,
+                candidate,
+                source_in,
+                source_out,
+                reference_duration,
+            )
         matches.append(
             {
                 "source_path": candidate["source_path"],
@@ -213,7 +224,7 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
 
 
 def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict, reference_features: dict, reranker_model: dict | None, ranked: list[dict], matches: list[dict]) -> dict:
-    diagnostics = source_window_diagnostics(request, reference_features, ranked)
+    diagnostics = source_window_diagnostics(request, reference_features, ranked, matches)
     return {
         "schema_version": "0.1.0",
         "model_id": model_manifest["model_id"],
@@ -221,7 +232,7 @@ def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict
         "reference": {
             "path": request.reference_path,
             "fps": float(reference_features.get("fps", 24.0) or 24.0),
-            "duration_frames": max(1, int(reference_features.get("duration_frames", 0) or 0)),
+            "duration_frames": max(1, reference_window_duration(reference_features)),
         },
         "ranking": {
             "candidate_group_count": len({candidate.candidate_group_id for candidate in request.candidates}),
@@ -233,18 +244,28 @@ def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict
     }
 
 
-def source_window_diagnostics(request: SourceWindowMatchRequest, reference_features: dict, ranked: list[dict]) -> dict:
+def source_window_diagnostics(request: SourceWindowMatchRequest, reference_features: dict, ranked: list[dict], matches: list[dict] | None = None) -> dict:
     reference_window = reference_features.get("source_window") if isinstance(reference_features.get("source_window"), dict) else {}
     reference_start = int(reference_window.get("source_in", 0) or 0)
     reference_end = int(reference_window.get("source_out", reference_start + max(1, int(reference_features.get("duration_frames", 0) or 1))) or reference_start + 1)
     reference_segment_id = str(reference_window.get("source_clip_id") or Path(request.reference_feature_manifest_path).stem)
     selected_id = str(ranked[0]["candidate_id"]) if ranked else ""
+    selected_match_by_candidate_id = {}
+    for match in matches or []:
+        params = match.get("reconstruction", {}).get("parameters", {}) if isinstance(match.get("reconstruction"), dict) else {}
+        candidate_id_for_match = str(params.get("candidate_id", ""))
+        if candidate_id_for_match:
+            selected_match_by_candidate_id[candidate_id_for_match] = match
     candidate_rows = []
     for item in ranked:
         candidate_id = str(item.get("candidate_id", ""))
         window = item.get("window_candidates", [{}])[0] if item.get("window_candidates") else {}
         source_start = int(window.get("source_in", item.get("source_in", 0)) or 0)
         source_end = int(window.get("source_out", item.get("source_out", source_start + 1)) or source_start + 1)
+        selected_match = selected_match_by_candidate_id.get(candidate_id)
+        if selected_match is not None:
+            source_start = int(selected_match.get("source_in", source_start))
+            source_end = int(selected_match.get("source_out", source_end))
         raw_distance = float(item.get("raw_distance", item.get("distance", float("inf"))))
         final_distance = float(item.get("distance", float("inf")))
         candidate_rows.append(
@@ -287,6 +308,70 @@ def candidate_source_segment_id(candidate_id: str) -> str:
     if "_refcut_" in candidate_id:
         return candidate_id.split("_refcut_", 1)[0]
     return candidate_id
+
+
+def reference_window_duration(reference_features: dict) -> int:
+    reference_window = reference_features.get("source_window")
+    if isinstance(reference_window, dict):
+        source_in = int(reference_window.get("source_in", 0) or 0)
+        source_out = int(reference_window.get("source_out", source_in + 1) or source_in + 1)
+        if source_out > source_in:
+            return source_out - source_in
+    return max(1, int(reference_features.get("duration_frames", 0) or 1))
+
+
+def refine_selected_source_window(
+    reference_path: str,
+    reference_features: dict,
+    candidate: dict,
+    source_in: int,
+    source_out: int,
+    reference_duration: int,
+) -> tuple[int, int]:
+    full_source_in, full_source_out = source_range(candidate["features"], reference_duration)
+    max_start = max(full_source_in, full_source_out - reference_duration)
+    if reference_duration <= 2 or max_start <= full_source_in:
+        return source_in, source_out
+
+    refined_start = max(full_source_in, min(max_start, source_in))
+    handle_slack = max(0, full_source_out - full_source_in - reference_duration)
+    if refined_start == full_source_in and handle_slack > 0 and handle_slack / max(1, reference_duration) <= 0.5:
+        refined_start = max(full_source_in, min(max_start, full_source_in + round(handle_slack * 0.67)))
+
+    try:
+        from PIL import Image, ImageOps
+        import numpy as np
+    except Exception:
+        return refined_start, min(full_source_out, refined_start + reference_duration)
+
+    source_duration = max(1, full_source_out - full_source_in)
+    if source_duration >= reference_duration * 1.5:
+        reference_window = reference_features.get("source_window") if isinstance(reference_features.get("source_window"), dict) else {}
+        reference_start = int(reference_window.get("source_in", 0) or 0)
+        reference_fps = float(reference_features.get("fps", 30.0) or 30.0)
+        source_fps = float(candidate["features"].get("fps", reference_fps) or reference_fps)
+        boundary = refine_boundary_start(
+            reference_path,
+            reference_features,
+            candidate,
+            full_source_in,
+            max_start,
+            reference_start,
+            reference_duration,
+            reference_fps,
+            source_fps,
+            np,
+            Image,
+            ImageOps,
+            baseline_start=refined_start,
+        )
+        baseline_distance = boundary.get("baseline_distance") if boundary is not None else None
+        boundary_distance = boundary.get("distance") if boundary is not None else None
+        improvement = float(baseline_distance) - float(boundary_distance) if baseline_distance is not None and boundary_distance is not None else 0.0
+        if boundary is not None and improvement >= 2.0:
+            refined_start = int(boundary["source_in"])
+
+    return refined_start, min(full_source_out, refined_start + reference_duration)
 
 
 def match(request: MatchRequest) -> dict:
