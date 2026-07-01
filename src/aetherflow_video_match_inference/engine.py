@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .features import color_distance, confidence_from_distance, load_feature_manifest
 from .media_window import media_window_rescore, refine_boundary_start
+from .placement import load_placement_model, placement_candidates_for_match, placement_model_summary
 from .reranker import load_reranker_model, rank_candidates, reranker_model_summary
 
 
@@ -39,6 +40,7 @@ class SourceWindowMatchRequest:
     candidates: tuple[SourceWindowCandidate, ...]
     transforms: tuple[dict, ...] = ()
     reranker_model_path: str | None = None
+    placement_model_path: str | None = None
 
 
 def describe_request(request: MatchRequest) -> dict[str, object]:
@@ -60,6 +62,7 @@ def describe_source_window_request(request: SourceWindowMatchRequest) -> dict[st
         "candidate_group_count": len({candidate.candidate_group_id for candidate in request.candidates}),
         "transform_types": sorted({str(transform.get("type")) for transform in request.transforms if transform.get("type")}),
         "reranker_model_path": request.reranker_model_path,
+        "placement_model_path": request.placement_model_path,
     }
 
 
@@ -77,11 +80,12 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
     model_manifest = load_model_manifest(request.model_manifest_path)
     reference_features = load_feature_manifest(request.reference_feature_manifest_path)
     reranker_model = load_reranker_model(request.reranker_model_path) if request.reranker_model_path else None
+    placement_model = load_placement_model(request.placement_model_path) if request.placement_model_path else None
     candidates = [source_window_candidate_to_scoring_input(candidate) for candidate in request.candidates]
     ranked = rank_candidates(reference_features, candidates, list(request.transforms), reranker_model)
     ranked = rescore_ranked_source_windows_with_media(request, reference_features, candidates, ranked)
     if not ranked:
-        return source_window_result(request, model_manifest, reference_features, reranker_model, [], [])
+        return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, [], [])
 
     selected_group_id = str(ranked[0]["candidate_id"])
     selected_candidates = [
@@ -90,8 +94,8 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
         if str(candidate.get("candidate_group_id") or candidate["candidate_id"]) == selected_group_id
     ]
     selected_candidates.sort(key=lambda candidate: (candidate["source_window_entry"].get("role", ""), int(candidate["source_window_entry"].get("source_in", 0)), candidate["candidate_id"]))
-    selected_matches = source_window_matches_from_candidates(request, reference_features, selected_candidates, ranked[0])
-    return source_window_result(request, model_manifest, reference_features, reranker_model, ranked, selected_matches)
+    selected_matches = source_window_matches_from_candidates(request, reference_features, selected_candidates, ranked[0], placement_model)
+    return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, ranked, selected_matches)
 
 
 def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], ranked: list[dict]) -> list[dict]:
@@ -163,7 +167,7 @@ def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -
     }
 
 
-def source_window_matches_from_candidates(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], top_ranked: dict) -> list[dict]:
+def source_window_matches_from_candidates(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], top_ranked: dict, placement_model: dict | None = None) -> list[dict]:
     reference_duration = reference_window_duration(reference_features)
     source_window_lengths = [source_window_length(candidate["features"]) for candidate in candidates]
     total_window_length = sum(source_window_lengths)
@@ -196,6 +200,30 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
                 source_out,
                 reference_duration,
             )
+        placement = None
+        if placement_model is not None:
+            placement = placement_candidates_for_match(
+                reference_path=request.reference_path,
+                source_path=candidate["source_path"],
+                reference_start_frame=reference_feature_start(reference_features) + reference_in,
+                reference_duration=max(1, reference_out - reference_in),
+                source_start_frame=source_in,
+                source_duration=max(1, source_out - source_in),
+                fps=float(reference_features.get("fps", 30.0) or 30.0),
+                model=placement_model,
+            )
+        reconstruction_parameters = {
+            "candidate_id": candidate["candidate_id"],
+            "candidate_group_id": candidate.get("candidate_group_id"),
+            "source_clip_id": candidate["clip_id"],
+            "role": candidate["source_window_entry"].get("role"),
+            "group_distance": top_ranked["distance"],
+            "raw_group_distance": top_ranked.get("raw_distance"),
+            "window_distance": window_distance,
+            "transforms": list(request.transforms),
+        }
+        if placement is not None:
+            reconstruction_parameters["placement"] = placement
         matches.append(
             {
                 "source_path": candidate["source_path"],
@@ -203,27 +231,19 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
                 "reference_out": reference_out,
                 "source_in": source_in,
                 "source_out": source_out,
+                **placement_match_fields(placement),
                 "timeline_track": int(candidate.get("timeline_track", 0)),
                 "confidence": confidence_from_distance(max(0.0, window_distance)),
                 "reconstruction": {
                     "operation": "source_window_reranker_match",
-                    "parameters": {
-                        "candidate_id": candidate["candidate_id"],
-                        "candidate_group_id": candidate.get("candidate_group_id"),
-                        "source_clip_id": candidate["clip_id"],
-                        "role": candidate["source_window_entry"].get("role"),
-                        "group_distance": top_ranked["distance"],
-                        "raw_group_distance": top_ranked.get("raw_distance"),
-                        "window_distance": window_distance,
-                        "transforms": list(request.transforms),
-                    },
+                    "parameters": reconstruction_parameters,
                 },
             }
         )
     return matches
 
 
-def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict, reference_features: dict, reranker_model: dict | None, ranked: list[dict], matches: list[dict]) -> dict:
+def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict, reference_features: dict, reranker_model: dict | None, placement_model: dict | None, ranked: list[dict], matches: list[dict]) -> dict:
     diagnostics = source_window_diagnostics(request, reference_features, ranked, matches)
     return {
         "schema_version": "0.1.0",
@@ -238,6 +258,7 @@ def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict
             "candidate_group_count": len({candidate.candidate_group_id for candidate in request.candidates}),
             "top_candidates": ranked[:10],
             "reranker_model": reranker_model_summary(reranker_model),
+            "placement_model": placement_model_summary(placement_model),
         },
         "diagnostics": diagnostics,
         "matches": matches,
@@ -318,6 +339,30 @@ def reference_window_duration(reference_features: dict) -> int:
         if source_out > source_in:
             return source_out - source_in
     return max(1, int(reference_features.get("duration_frames", 0) or 1))
+
+
+def reference_feature_start(reference_features: dict) -> int:
+    reference_window = reference_features.get("source_window")
+    if isinstance(reference_window, dict):
+        return int(reference_window.get("source_in", 0) or 0)
+    return 0
+
+
+def placement_match_fields(placement: dict | None) -> dict:
+    if placement is None:
+        return {}
+    return {
+        "referencePlacementFrame": placement.get("referencePlacementFrame"),
+        "sourcePlacementFrame": placement.get("sourcePlacementFrame"),
+        "referencePlacementTime": placement.get("referencePlacementTime"),
+        "sourcePlacementTime": placement.get("sourcePlacementTime"),
+        "placementFrameConfidence": placement.get("placementFrameConfidence"),
+        "cropXHint": placement.get("cropXHint"),
+        "scalePrior": placement.get("scalePrior"),
+        "placementSampleCandidates": placement.get("placementSampleCandidates", []),
+        "placementSampleCandidateCount": placement.get("placementSampleCandidateCount"),
+        "placementCandidatePolicy": placement.get("placementCandidatePolicy"),
+    }
 
 
 def refine_selected_source_window(

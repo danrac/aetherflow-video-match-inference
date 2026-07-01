@@ -175,6 +175,7 @@ def load_source_window_match_request(path: str | Path, schema_path: str | Path |
         candidates=tuple(candidates),
         transforms=tuple(document.get("transforms", [])),
         reranker_model_path=str(document["reranker_model_path"]) if document.get("reranker_model_path") else None,
+        placement_model_path=str(document["placement_model_path"]) if document.get("placement_model_path") else None,
     )
 
 

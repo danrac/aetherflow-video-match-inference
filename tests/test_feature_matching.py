@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from aetherflow_video_match_inference.adapters import to_host_payload
-from aetherflow_video_match_inference.cli import main as cli_main
+from aetherflow_video_match_inference.cli import load_source_window_match_request, main as cli_main
 from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, match, match_source_windows
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
@@ -511,6 +511,7 @@ class FeatureMatchingTests(unittest.TestCase):
                     "reference_path": "/tmp/reference.mp4",
                     "model_manifest_path": "/tmp/model_manifest.json",
                     "reference_feature_manifest_path": "/tmp/reference.features.json",
+                    "placement_model_path": "/tmp/placement_keyframe_model.json",
                     "candidates": [
                         {
                             "candidate_id": "candidate-a",
@@ -526,8 +527,10 @@ class FeatureMatchingTests(unittest.TestCase):
             )
 
             exit_code = cli_main(["validate-source-window-request", "--request", str(request_path), "--schema", str(schema_path)])
+            request = load_source_window_match_request(request_path, schema_path=schema_path)
 
             self.assertEqual(exit_code, 0)
+            self.assertEqual(request.placement_model_path, "/tmp/placement_keyframe_model.json")
 
     def test_cli_rejects_invalid_source_window_request_schema(self) -> None:
         schema_path = CONTRACTS_ROOT / "schemas" / "source_window_match_request.schema.json"
