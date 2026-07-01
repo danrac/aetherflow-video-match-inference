@@ -93,6 +93,8 @@ def placement_candidates_for_match(
     fps: float,
     model: dict[str, Any] | None,
     top_k: int | None = None,
+    request_metadata: dict[str, Any] | None = None,
+    candidate_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if reference_duration <= 2 or source_duration <= 2:
         return None
@@ -136,7 +138,13 @@ def placement_candidates_for_match(
     candidates.sort(key=lambda item: (-float(item.get("placementRankingScore", item["confidence"])), int(item["referencePlacementFrame"]), int(item["sourcePlacementFrame"])))
     selected = candidates[0]
     retained_candidates = candidates[: max(1, min(int(top_k), len(candidates)))]
-    return {
+    recommended_transform = recommended_transform_candidate(
+        reference_path=reference_path,
+        source_path=source_path,
+        request_metadata=request_metadata,
+        candidate_metadata=candidate_metadata,
+    )
+    placement = {
         "referencePlacementFrame": selected["referencePlacementFrame"],
         "sourcePlacementFrame": selected["sourcePlacementFrame"],
         "referencePlacementTime": selected["referencePlacementTime"],
@@ -159,6 +167,119 @@ def placement_candidates_for_match(
         },
         "placementModel": placement_model_summary(model),
     }
+    if recommended_transform is not None:
+        placement["recommendedTransformCandidate"] = recommended_transform
+        placement["recommendedTransformPolicy"] = recommended_transform["policy"]
+    return placement
+
+
+def recommended_transform_candidate(
+    *,
+    reference_path: str,
+    source_path: str,
+    request_metadata: dict[str, Any] | None,
+    candidate_metadata: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    metadata = merged_transform_metadata(request_metadata, candidate_metadata)
+    explicit = first_mapping(metadata, ("canonical_placement_transform", "placement_transform", "recommended_transform"))
+    if explicit is not None:
+        position = explicit.get("position")
+        scale = explicit.get("scale")
+        if valid_position(position) and scale is not None:
+            return {
+                "method": "metadata_recommended_transform",
+                "policy": "canonical_metadata_transform",
+                "position": [round(float(position[0]), 6), round(float(position[1]), 6)],
+                "scale": round(float(scale), 6),
+                "confidence": float(explicit.get("confidence", 1.0) or 1.0),
+                "source": "metadata.placement_transform",
+            }
+
+    editor_transform = first_mapping(metadata, ("canonical_editor_transform", "editor_transform", "transform"))
+    if editor_transform is None:
+        return None
+    target_width, target_height = target_size_from_metadata_or_video(metadata, reference_path)
+    source_width, source_height = source_size_from_metadata_or_video(metadata, source_path)
+    if target_width <= 0 or target_height <= 0 or source_height <= 0:
+        return None
+    scale_factor = float(editor_transform.get("scale_factor", 1.0) or 1.0)
+    x_offset_percent = float(editor_transform.get("x_offset_percent", 0.0) or 0.0)
+    y_offset_percent = float(editor_transform.get("y_offset_percent", 0.0) or 0.0)
+    base_scale = float(metadata.get("base_scale", 0.0) or 0.0)
+    if base_scale <= 0:
+        base_scale = (target_height / source_height) * 100.0
+    position_x = (target_width / 2.0) + ((x_offset_percent / 100.0) * target_width)
+    position_y = (target_height / 2.0) + ((y_offset_percent / 100.0) * target_height)
+    return {
+        "method": "metadata_editor_transform",
+        "policy": "canonical_metadata_transform",
+        "position": [round(position_x, 6), round(position_y, 6)],
+        "scale": round(base_scale * scale_factor, 6),
+        "confidence": 1.0,
+        "source": "metadata.editor_transform",
+        "baseScale": round(base_scale, 6),
+        "scaleFactor": round(scale_factor, 6),
+        "offsetPercent": [round(x_offset_percent, 6), round(y_offset_percent, 6)],
+        "targetSize": [int(round(target_width)), int(round(target_height))],
+        "sourceSize": [int(round(source_width)), int(round(source_height))],
+    }
+
+
+def merged_transform_metadata(request_metadata: dict[str, Any] | None, candidate_metadata: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    if isinstance(request_metadata, dict):
+        merged.update(request_metadata)
+    if isinstance(candidate_metadata, dict):
+        merged.update(candidate_metadata)
+    return merged
+
+
+def first_mapping(metadata: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any] | None:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def valid_position(value: Any) -> bool:
+    return isinstance(value, (list, tuple)) and len(value) >= 2 and value[0] is not None and value[1] is not None
+
+
+def target_size_from_metadata_or_video(metadata: dict[str, Any], reference_path: str) -> tuple[float, float]:
+    size = first_size(metadata, ("target_size", "output_size", "vertical_size", "comp_size", "reference_size"))
+    if size is not None:
+        return size
+    return video_size(reference_path)
+
+
+def source_size_from_metadata_or_video(metadata: dict[str, Any], source_path: str) -> tuple[float, float]:
+    size = first_size(metadata, ("source_size", "full_frame_size"))
+    if size is not None:
+        return size
+    width = metadata.get("source_width")
+    height = metadata.get("source_height")
+    if width is not None and height is not None:
+        return float(width), float(height)
+    return video_size(source_path)
+
+
+def first_size(metadata: dict[str, Any], keys: tuple[str, ...]) -> tuple[float, float] | None:
+    for key in keys:
+        value = metadata.get(key)
+        if isinstance(value, dict) and value.get("width") is not None and value.get("height") is not None:
+            return float(value["width"]), float(value["height"])
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            return float(value[0]), float(value[1])
+    return None
+
+
+def video_size(path: str) -> tuple[float, float]:
+    capture = cv2.VideoCapture(str(path))
+    width = float(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0)
+    height = float(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0)
+    capture.release()
+    return width, height
 
 
 def pair_features(reference_image: Any, source_image: Any, fraction: float, duration: int) -> tuple[dict[str, float], dict[str, float]]:

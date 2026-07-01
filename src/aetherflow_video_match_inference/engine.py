@@ -368,6 +368,8 @@ def placement_for_ranked_candidate(
         source_duration=max(1, source_out - source_in),
         fps=float(reference_features.get("fps", 30.0) or 30.0),
         model=placement_model,
+        request_metadata=request.metadata,
+        candidate_metadata=candidate.get("metadata"),
     )
 
 
@@ -606,6 +608,8 @@ def placement_match_fields(placement: dict | None) -> dict:
         "placementCandidatePolicy": placement.get("placementCandidatePolicy"),
         "placementRankingMode": placement.get("placementRankingMode"),
         "placementDiagnostics": placement.get("placementDiagnostics"),
+        "recommendedTransformCandidate": placement.get("recommendedTransformCandidate"),
+        "recommendedTransformPolicy": placement.get("recommendedTransformPolicy"),
     }
 
 
@@ -625,6 +629,8 @@ def ranked_candidate_placement_fields(ranked_item: dict, selected_match: dict | 
         "placementCandidatePolicy",
         "placementRankingMode",
         "placementDiagnostics",
+        "recommendedTransformCandidate",
+        "recommendedTransformPolicy",
     ):
         if key in source:
             fields[key] = source.get(key)

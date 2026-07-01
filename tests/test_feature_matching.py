@@ -16,7 +16,7 @@ from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCa
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
-from aetherflow_video_match_inference.placement import pair_features, placement_diagnostics, placement_ranking_score, placement_sample_offsets
+from aetherflow_video_match_inference.placement import pair_features, placement_diagnostics, placement_ranking_score, placement_sample_offsets, recommended_transform_candidate
 from aetherflow_video_match_inference.sequence_assignment import assign_ranked_reference_sequence
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
@@ -565,6 +565,29 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertIn("featureAffineHint", diagnostics)
         self.assertGreaterEqual(ranking_score, 0.0)
         self.assertLessEqual(ranking_score, 1.0)
+
+    def test_recommended_transform_candidate_from_editor_metadata(self) -> None:
+        transform = recommended_transform_candidate(
+            reference_path="/tmp/reference.mp4",
+            source_path="/tmp/source.mp4",
+            request_metadata={
+                "target_size": {"width": 1080, "height": 1920},
+                "source_size": {"width": 1920, "height": 1080},
+                "editor_transform": {
+                    "scale_factor": 1.0827316240361702,
+                    "x_offset_percent": 15.199549943574326,
+                    "y_offset_percent": 2.3878772062436724,
+                },
+            },
+            candidate_metadata=None,
+        )
+
+        self.assertIsNotNone(transform)
+        assert transform is not None
+        self.assertEqual(transform["policy"], "canonical_metadata_transform")
+        self.assertAlmostEqual(transform["position"][0], 704.155139, places=3)
+        self.assertAlmostEqual(transform["position"][1], 1005.847242, places=3)
+        self.assertAlmostEqual(transform["scale"], 192.485622, places=3)
 
     def test_cli_runs_source_window_match_from_json_request(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-cli-") as temp_dir:
