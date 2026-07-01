@@ -10,6 +10,7 @@ from .adapters import to_host_payload
 from .engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, match, match_source_windows
 from .interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json
 from .onnx_runtime import validate_onnx_model, validate_reranker_onnx_model
+from .request_audit import audit_source_window_run
 from .storage import inference_output_path
 
 
@@ -33,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_source_window = subcommands.add_parser("validate-source-window-request")
     validate_source_window.add_argument("--request", required=True)
     validate_source_window.add_argument("--schema")
+
+    audit_source_window = subcommands.add_parser("audit-source-window-run")
+    audit_source_window.add_argument("--run-dir", required=True)
+    audit_source_window.add_argument("--fixture-manifest")
+    audit_source_window.add_argument("--output", required=True)
 
     validate_model = subcommands.add_parser("validate-model")
     validate_model.add_argument("--model-manifest", required=True)
@@ -101,6 +107,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "validate-source-window-request":
         validate_source_window_request_document(args.request, args.schema)
         print("source-window request validation ok")
+        return 0
+    if args.command == "audit-source-window-run":
+        report = audit_source_window_run(args.run_dir, fixture_manifest_path=args.fixture_manifest)
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(output_path)
         return 0
     if args.command == "validate-model":
         with Path(args.model_manifest).open("r", encoding="utf-8") as handle:

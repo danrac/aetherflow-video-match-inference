@@ -610,6 +610,70 @@ class FeatureMatchingTests(unittest.TestCase):
 
             self.assertIn("reference_feature_manifest_path", str(context.exception))
 
+    def test_cli_audits_source_window_run_against_fixture_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-request-audit-") as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "run"
+            source_window_root = run_dir / "_source_window_match"
+            manifest_path = root / "fixture_manifest.json"
+            write_json(
+                manifest_path,
+                {
+                    "output_fps": 30,
+                    "reference_segments": [
+                        {"duration_seconds": 4.0, "source_path": "/tmp/source-a.mp4"},
+                        {"duration_seconds": 3.0, "source_path": "/tmp/source-b.mp4"},
+                    ],
+                },
+            )
+            for index, (start, end) in enumerate(((0, 60), (60, 120), (120, 210)), start=1):
+                request_dir = source_window_root / f"reference_reference_seg_{index:03d}"
+                request_dir.mkdir(parents=True)
+                reference_features = request_dir / "reference.features.json"
+                source_features = request_dir / "source.features.json"
+                write_feature_manifest(reference_features, f"reference_seg_{index:03d}", [100.0, 120.0, 140.0], source_window={"source_in": start, "source_out": end})
+                write_feature_manifest(source_features, "stringout_seg_001", [101.0, 121.0, 141.0], source_window={"source_in": 0, "source_out": 210})
+                write_json(
+                    request_dir / "source_window_request.json",
+                    {
+                        "schema_version": "0.1.0",
+                        "reference_path": "/tmp/reference.mp4",
+                        "model_manifest_path": "/tmp/model.json",
+                        "reference_feature_manifest_path": str(reference_features),
+                        "placement_model_path": "/tmp/placement.json",
+                        "candidates": [
+                            {
+                                "candidate_id": "stringout_seg_001_refcut_0000",
+                                "candidate_group_id": "stringout_seg_001_refcut_0000",
+                                "source_path": "/tmp/stringout.mp4",
+                                "source_clip_id": "stringout",
+                                "feature_manifest_path": str(source_features),
+                                "source_in": 0,
+                                "source_out": 210,
+                            }
+                        ],
+                    },
+                )
+            output_path = root / "audit.json"
+
+            exit_code = cli_main([
+                "audit-source-window-run",
+                "--run-dir",
+                str(run_dir),
+                "--fixture-manifest",
+                str(manifest_path),
+                "--output",
+                str(output_path),
+            ])
+            report = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(report["status"], "segment_shape_mismatch")
+            self.assertEqual(report["summary"]["canonicalReferenceSegmentCount"], 2)
+            self.assertEqual(report["summary"]["cepReferenceRequestCount"], 3)
+            self.assertTrue(report["summary"]["allRequestsHavePlacementModelPath"])
+            self.assertEqual(report["cepReferenceRequests"][0]["parentCanonicalSegments"][0]["canonicalReferenceSegmentId"], "canonical_ref_001")
+
     def test_source_window_match_exports_to_host_payload_and_cep_json(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-host-") as temp_dir:
             root = Path(temp_dir)
