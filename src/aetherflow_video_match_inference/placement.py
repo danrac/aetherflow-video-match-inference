@@ -210,6 +210,8 @@ def recommended_transform_candidate(
         base_scale = (target_height / source_height) * 100.0
     position_x = (target_width / 2.0) + ((x_offset_percent / 100.0) * target_width)
     position_y = (target_height / 2.0) + ((y_offset_percent / 100.0) * target_height)
+    crop_basis = crop_basis_correction(metadata, target_width, target_height, source_width, scale_factor, base_scale)
+    position_x += crop_basis["offset_x"]
     return {
         "method": "metadata_editor_transform",
         "policy": "canonical_metadata_transform",
@@ -222,6 +224,7 @@ def recommended_transform_candidate(
         "offsetPercent": [round(x_offset_percent, 6), round(y_offset_percent, 6)],
         "targetSize": [int(round(target_width)), int(round(target_height))],
         "sourceSize": [int(round(source_width)), int(round(source_height))],
+        "cropBasisCorrection": crop_basis,
     }
 
 
@@ -262,6 +265,47 @@ def source_size_from_metadata_or_video(metadata: dict[str, Any], source_path: st
     if width is not None and height is not None:
         return float(width), float(height)
     return video_size(source_path)
+
+
+def content_source_size_from_metadata(metadata: dict[str, Any]) -> tuple[float, float] | None:
+    size = first_size(metadata, ("content_source_size", "original_source_size", "source_content_size"))
+    if size is not None:
+        return size
+    width = metadata.get("content_source_width", metadata.get("original_source_width"))
+    height = metadata.get("content_source_height", metadata.get("original_source_height"))
+    if width is not None and height is not None:
+        return float(width), float(height)
+    if metadata.get("vertical_crop_x_factor") is not None and metadata.get("source_width") is not None and metadata.get("source_height") is not None:
+        return float(metadata["source_width"]), float(metadata["source_height"])
+    return None
+
+
+def crop_basis_correction(metadata: dict[str, Any], target_width: float, target_height: float, layer_source_width: float, scale_factor: float, base_scale: float) -> dict[str, Any]:
+    crop_factor = metadata.get("vertical_crop_x_factor", metadata.get("crop_x_factor"))
+    content_size = content_source_size_from_metadata(metadata)
+    if crop_factor is None or content_size is None:
+        return {"applied": False, "offset_x": 0.0}
+    content_width, content_height = content_size
+    if content_width <= 0 or content_height <= 0 or layer_source_width <= 0:
+        return {"applied": False, "offset_x": 0.0}
+    target_aspect = target_width / max(1.0, target_height)
+    content_aspect = content_width / max(1.0, content_height)
+    if content_aspect <= target_aspect:
+        return {"applied": False, "offset_x": 0.0, "reason": "content_not_wider_than_target"}
+    crop_width = content_height * target_aspect
+    crop_left = (content_width - crop_width) * float(crop_factor)
+    crop_center_content = crop_left + (crop_width / 2.0)
+    crop_center_layer = (crop_center_content / content_width) * layer_source_width
+    ae_scale = (base_scale * scale_factor) / 100.0
+    offset_x = ((layer_source_width / 2.0) - crop_center_layer) * ae_scale
+    return {
+        "applied": True,
+        "offset_x": round(offset_x, 6),
+        "verticalCropXFactor": round(float(crop_factor), 6),
+        "contentSourceSize": [int(round(content_width)), int(round(content_height))],
+        "cropCenterLayerX": round(crop_center_layer, 6),
+        "reason": "full_layer_position_adjusted_to_match_vertical_crop_center",
+    }
 
 
 def first_size(metadata: dict[str, Any], keys: tuple[str, ...]) -> tuple[float, float] | None:

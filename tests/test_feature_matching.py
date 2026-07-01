@@ -589,6 +589,32 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertAlmostEqual(transform["position"][1], 1005.847242, places=3)
         self.assertAlmostEqual(transform["scale"], 192.485622, places=3)
 
+    def test_recommended_transform_candidate_applies_crop_basis_for_landscape_source(self) -> None:
+        transform = recommended_transform_candidate(
+            reference_path="/tmp/reference.mp4",
+            source_path="/tmp/source.mp4",
+            request_metadata={
+                "target_size": {"width": 1080, "height": 1920},
+                "source_size": {"width": 1920, "height": 1080},
+                "source_width": 3840,
+                "source_height": 2160,
+                "vertical_crop_x_factor": 0.15,
+                "editor_transform": {
+                    "scale_factor": 1.0827316240361702,
+                    "x_offset_percent": 15.199549943574326,
+                    "y_offset_percent": 2.3878772062436724,
+                },
+            },
+            candidate_metadata=None,
+        )
+
+        self.assertIsNotNone(transform)
+        assert transform is not None
+        self.assertTrue(transform["cropBasisCorrection"]["applied"])
+        self.assertAlmostEqual(transform["position"][0], 1588.385965, places=3)
+        self.assertAlmostEqual(transform["position"][1], 1005.847242, places=3)
+        self.assertAlmostEqual(transform["scale"], 192.485622, places=3)
+
     def test_cli_runs_source_window_match_from_json_request(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-cli-") as temp_dir:
             root = Path(temp_dir)
