@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -265,6 +266,7 @@ def resize_to_reference(frame: Any, reference_frame: Any) -> Any:
     return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
 
+@lru_cache(maxsize=1024)
 def read_video_frame(path: str, frame_index: int) -> Any | None:
     capture = cv2.VideoCapture(str(path))
     capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_index)))

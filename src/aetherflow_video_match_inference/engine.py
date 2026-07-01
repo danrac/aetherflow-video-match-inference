@@ -9,6 +9,8 @@ from .media_window import media_window_rescore, refine_boundary_start
 from .placement import load_placement_model, placement_candidates_for_match, placement_model_summary
 from .reranker import load_reranker_model, rank_candidates, reranker_model_summary
 
+DEFAULT_RANKED_PLACEMENT_LIMIT = 10
+
 
 @dataclass(frozen=True)
 class MatchRequest:
@@ -84,6 +86,7 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
     candidates = [source_window_candidate_to_scoring_input(candidate) for candidate in request.candidates]
     ranked = rank_candidates(reference_features, candidates, list(request.transforms), reranker_model)
     ranked = rescore_ranked_source_windows_with_media(request, reference_features, candidates, ranked)
+    ranked = attach_placement_to_ranked_candidates(request, reference_features, candidates, ranked, placement_model)
     if not ranked:
         return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, [], [])
 
@@ -142,6 +145,105 @@ def annotate_media_window_candidates(window_candidates: list[dict], media: dict)
             updated["source_out"] = int(media.get("source_out", updated.get("source_out", updated.get("source_in", 0) + 1)))
         annotated.append(updated)
     return annotated
+
+
+def attach_placement_to_ranked_candidates(
+    request: SourceWindowMatchRequest,
+    reference_features: dict,
+    candidates: list[dict],
+    ranked: list[dict],
+    placement_model: dict | None,
+) -> list[dict]:
+    """Attach placement keyframe metadata to sequence-selectable ranked rows."""
+
+    if placement_model is None or not ranked:
+        return ranked
+    candidate_groups: dict[str, list[dict]] = {}
+    for candidate in candidates:
+        group_id = str(candidate.get("candidate_group_id") or candidate["candidate_id"])
+        candidate_groups.setdefault(group_id, []).append(candidate)
+    placement_limit = ranked_placement_candidate_limit(placement_model)
+    enriched = []
+    for rank_index, item in enumerate(ranked):
+        updated = dict(item)
+        if rank_index >= placement_limit:
+            updated.setdefault("placementCandidatePolicy", "outside_ranked_candidate_placement_limit")
+            updated.setdefault("placementSampleCandidateCount", 0)
+            enriched.append(updated)
+            continue
+        group_id = str(item.get("candidate_id", ""))
+        placement = placement_for_ranked_candidate(request, reference_features, candidate_groups.get(group_id, []), updated, placement_model)
+        if placement is not None:
+            updated["placement"] = placement
+            updated.update(placement_match_fields(placement))
+        else:
+            updated.setdefault("placementCandidatePolicy", "placement_unavailable")
+            updated.setdefault("placementSampleCandidateCount", 0)
+        enriched.append(updated)
+    return enriched
+
+
+def ranked_placement_candidate_limit(placement_model: dict) -> int:
+    configured = placement_model.get("ranked_candidate_output_limit") if isinstance(placement_model, dict) else None
+    try:
+        limit = int(configured)
+    except (TypeError, ValueError):
+        limit = DEFAULT_RANKED_PLACEMENT_LIMIT
+    return max(1, limit)
+
+
+def placement_for_ranked_candidate(
+    request: SourceWindowMatchRequest,
+    reference_features: dict,
+    candidates: list[dict],
+    ranked_item: dict,
+    placement_model: dict,
+) -> dict | None:
+    if not candidates:
+        return None
+    candidates = sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate["source_window_entry"].get("role", ""),
+            int(candidate["source_window_entry"].get("source_in", 0)),
+            candidate["candidate_id"],
+        ),
+    )
+    candidate = representative_candidate_for_ranked_item(candidates, ranked_item)
+    reference_duration = reference_window_duration(reference_features)
+    source_in, source_out = source_range(candidate["features"], reference_duration)
+    scored_window = next((item for item in ranked_item.get("window_candidates", []) if item.get("candidate_id") == candidate["candidate_id"]), None)
+    if scored_window:
+        source_in = int(scored_window.get("source_in", source_in))
+        source_out = int(scored_window.get("source_out", source_out))
+        source_in, source_out = refine_selected_source_window(
+            request.reference_path,
+            reference_features,
+            candidate,
+            source_in,
+            source_out,
+            reference_duration,
+        )
+    return placement_candidates_for_match(
+        reference_path=request.reference_path,
+        source_path=candidate["source_path"],
+        reference_start_frame=reference_feature_start(reference_features),
+        reference_duration=reference_duration,
+        source_start_frame=source_in,
+        source_duration=max(1, source_out - source_in),
+        fps=float(reference_features.get("fps", 30.0) or 30.0),
+        model=placement_model,
+    )
+
+
+def representative_candidate_for_ranked_item(candidates: list[dict], ranked_item: dict) -> dict:
+    window_candidates = ranked_item.get("window_candidates", [])
+    if isinstance(window_candidates, list) and window_candidates:
+        best_candidate_id = str(window_candidates[0].get("candidate_id", ""))
+        for candidate in candidates:
+            if str(candidate.get("candidate_id", "")) == best_candidate_id:
+                return candidate
+    return candidates[0]
 
 
 def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -> dict:
@@ -303,6 +405,7 @@ def source_window_diagnostics(request: SourceWindowMatchRequest, reference_featu
                 "finalScore": confidence_from_distance(final_distance if final_distance != float("inf") else None),
                 "selected": candidate_id == selected_id,
                 "rejectionReason": "" if candidate_id == selected_id else "lower_ranked_candidate",
+                **ranked_candidate_placement_fields(item, selected_match),
             }
         )
     return {
@@ -363,6 +466,26 @@ def placement_match_fields(placement: dict | None) -> dict:
         "placementSampleCandidateCount": placement.get("placementSampleCandidateCount"),
         "placementCandidatePolicy": placement.get("placementCandidatePolicy"),
     }
+
+
+def ranked_candidate_placement_fields(ranked_item: dict, selected_match: dict | None = None) -> dict:
+    source = selected_match if selected_match is not None else ranked_item
+    fields = {}
+    for key in (
+        "referencePlacementFrame",
+        "sourcePlacementFrame",
+        "referencePlacementTime",
+        "sourcePlacementTime",
+        "placementFrameConfidence",
+        "cropXHint",
+        "scalePrior",
+        "placementSampleCandidates",
+        "placementSampleCandidateCount",
+        "placementCandidatePolicy",
+    ):
+        if key in source:
+            fields[key] = source.get(key)
+    return fields
 
 
 def refine_selected_source_window(

@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.cli import load_source_window_match_request, main as cli_main
@@ -454,6 +455,61 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(result["matches"][0]["reference_out"], 30)
             self.assertEqual(result["matches"][0]["source_in"], 108)
             self.assertEqual(result["matches"][0]["source_out"], 138)
+
+    def test_source_window_match_attaches_placement_to_ranked_candidates(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-ranked-placement-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            placement_model = root / "placement.json"
+            write_json(placement_model, {"model_id": "test-placement", "model_version": "0.0.1", "ranked_candidate_output_limit": 10})
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source_a_features = write_feature_manifest(root / "source-a.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            source_b_features = write_feature_manifest(root / "source-b.features.json", "clip-b", [105.0, 125.0, 145.0], source_window={"source_in": 40, "source_out": 64})
+
+            def fake_placement(**kwargs):
+                source_frame = int(kwargs["source_start_frame"]) + 6
+                reference_frame = int(kwargs["reference_start_frame"]) + 6
+                return {
+                    "referencePlacementFrame": reference_frame,
+                    "sourcePlacementFrame": source_frame,
+                    "referencePlacementTime": round(reference_frame / 24.0, 6),
+                    "sourcePlacementTime": round(source_frame / 24.0, 6),
+                    "placementFrameConfidence": 0.91,
+                    "cropXHint": 0.5,
+                    "scalePrior": 1.0,
+                    "placementSampleCandidates": [
+                        {
+                            "referencePlacementFrame": reference_frame,
+                            "sourcePlacementFrame": source_frame,
+                            "confidence": 0.91,
+                        }
+                    ],
+                    "placementSampleCandidateCount": 1,
+                    "placementCandidatePolicy": "ranked_fraction_samples",
+                }
+
+            with patch("aetherflow_video_match_inference.engine.placement_candidates_for_match", side_effect=fake_placement):
+                result = match_source_windows(
+                    SourceWindowMatchRequest(
+                        reference_path="/tmp/reference.mp4",
+                        model_manifest_path=str(model_manifest),
+                        reference_feature_manifest_path=str(reference_features),
+                        placement_model_path=str(placement_model),
+                        candidates=(
+                            SourceWindowCandidate("candidate-a", "edit-001", "/tmp/a.mp4", "clip-a", str(source_a_features), 3, 27),
+                            SourceWindowCandidate("candidate-b", "edit-002", "/tmp/b.mp4", "clip-b", str(source_b_features), 40, 64),
+                        ),
+                    )
+                )
+
+            self.assertEqual(len(result["ranking"]["top_candidates"]), 2)
+            for candidate in result["ranking"]["top_candidates"]:
+                self.assertEqual(candidate["placementSampleCandidateCount"], 1)
+                self.assertEqual(candidate["placementSampleCandidates"][0]["confidence"], 0.91)
+                self.assertIn("sourcePlacementFrame", candidate)
+            for candidate in result["diagnostics"]["rankedCandidates"]:
+                self.assertEqual(candidate["placementSampleCandidateCount"], 1)
+                self.assertEqual(candidate["placementSampleCandidates"][0]["confidence"], 0.91)
 
     def test_cli_runs_source_window_match_from_json_request(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-cli-") as temp_dir:
