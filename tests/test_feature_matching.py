@@ -16,6 +16,7 @@ from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCa
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
+from aetherflow_video_match_inference.placement import pair_features, placement_diagnostics, placement_ranking_score, placement_sample_offsets
 from aetherflow_video_match_inference.sequence_assignment import assign_ranked_reference_sequence
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
@@ -535,6 +536,35 @@ class FeatureMatchingTests(unittest.TestCase):
             for candidate in result["diagnostics"]["rankedCandidates"]:
                 self.assertEqual(candidate["placementSampleCandidateCount"], 1)
                 self.assertEqual(candidate["placementSampleCandidates"][0]["confidence"], 0.91)
+
+    def test_short_segment_placement_offsets_are_unique(self) -> None:
+        offsets = placement_sample_offsets([0.08, 0.16, 0.25, 0.38, 0.5, 0.62, 0.75, 0.88], 7)
+
+        self.assertGreaterEqual(len(offsets), 4)
+        self.assertEqual(len({offset for _, offset in offsets}), len(offsets))
+        self.assertTrue(all(1 <= offset <= 6 for _, offset in offsets))
+
+    def test_placement_diagnostics_include_geometry_confidence(self) -> None:
+        try:
+            import numpy as np
+        except Exception:
+            self.skipTest("numpy unavailable")
+
+        reference = np.zeros((96, 54, 3), dtype=np.uint8)
+        source = np.zeros((96, 171, 3), dtype=np.uint8)
+        reference[20:76, 12:42] = (220, 220, 220)
+        source[20:76, 70:100] = (220, 220, 220)
+
+        features, hints = pair_features(reference, source, 0.5, 30)
+        diagnostics = placement_diagnostics(features, hints, 30)
+        ranking_score = placement_ranking_score(0.5, features, 30, {"geometry_stability_weight": 0.22})
+
+        self.assertIn("geometryStabilityScore", diagnostics)
+        self.assertIn("transformTypeConfidence", diagnostics)
+        self.assertIn("xPlacementConfidence", diagnostics)
+        self.assertIn("featureAffineHint", diagnostics)
+        self.assertGreaterEqual(ranking_score, 0.0)
+        self.assertLessEqual(ranking_score, 1.0)
 
     def test_cli_runs_source_window_match_from_json_request(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-cli-") as temp_dir:

@@ -604,6 +604,8 @@ def placement_match_fields(placement: dict | None) -> dict:
         "placementSampleCandidates": placement.get("placementSampleCandidates", []),
         "placementSampleCandidateCount": placement.get("placementSampleCandidateCount"),
         "placementCandidatePolicy": placement.get("placementCandidatePolicy"),
+        "placementRankingMode": placement.get("placementRankingMode"),
+        "placementDiagnostics": placement.get("placementDiagnostics"),
     }
 
 
@@ -621,6 +623,8 @@ def ranked_candidate_placement_fields(ranked_item: dict, selected_match: dict | 
         "placementSampleCandidates",
         "placementSampleCandidateCount",
         "placementCandidatePolicy",
+        "placementRankingMode",
+        "placementDiagnostics",
     ):
         if key in source:
             fields[key] = source.get(key)

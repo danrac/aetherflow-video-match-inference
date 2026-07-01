@@ -27,6 +27,10 @@ FEATURE_NAMES = [
     "best_projection_scale",
     "best_projection_x",
     "best_projection_y",
+    "feature_affine_inlier_ratio",
+    "feature_affine_match_count",
+    "crop_ambiguity_score",
+    "geometry_stability_score",
 ]
 
 DEFAULT_SAMPLE_FRACTIONS = [0.08, 0.16, 0.25, 0.38, 0.5, 0.62, 0.75, 0.88]
@@ -54,6 +58,30 @@ def placement_model_summary(model: dict[str, Any] | None) -> dict[str, Any] | No
     }
 
 
+def placement_sample_offsets(fractions: list[Any], duration: int) -> list[tuple[float, int]]:
+    if duration <= 4:
+        offsets = list(range(1, max(2, duration)))
+        return [(round(offset / max(1, duration), 6), offset) for offset in offsets]
+
+    seen: set[int] = set()
+    samples: list[tuple[float, int]] = []
+    min_offset = 2
+    max_offset = max(min_offset, duration - 2)
+    for raw_fraction in fractions:
+        fraction = float(raw_fraction)
+        offset = min(max(min_offset, round(duration * fraction)), max_offset)
+        if offset in seen:
+            continue
+        seen.add(offset)
+        samples.append((fraction, offset))
+    if duration <= 12:
+        for offset in range(min_offset, max_offset + 1):
+            if offset not in seen:
+                seen.add(offset)
+                samples.append((round(offset / max(1, duration), 6), offset))
+    return samples
+
+
 def placement_candidates_for_match(
     *,
     reference_path: str,
@@ -76,9 +104,8 @@ def placement_candidates_for_match(
         top_k = int(configured_top_k) if configured_top_k else len(fractions)
     candidates = []
     duration = max(1, min(reference_duration, source_duration))
-    for fraction in fractions:
-        fraction = float(fraction)
-        offset = min(max(2, round(duration * fraction)), max(2, duration - 2))
+    sample_offsets = placement_sample_offsets(fractions, duration)
+    for fraction, offset in sample_offsets:
         reference_frame = int(reference_start_frame + offset)
         source_frame = int(source_start_frame + offset)
         reference_image = read_video_frame(reference_path, reference_frame)
@@ -87,6 +114,8 @@ def placement_candidates_for_match(
             continue
         features, hints = pair_features(reference_image, source_image, fraction, duration)
         confidence = predict_confidence(model, features) if model is not None else heuristic_confidence(features)
+        ranking_score = placement_ranking_score(confidence, features, duration, model)
+        diagnostics = placement_diagnostics(features, hints, duration)
         candidates.append(
             {
                 "referencePlacementFrame": reference_frame,
@@ -94,15 +123,17 @@ def placement_candidates_for_match(
                 "referencePlacementTime": round(reference_frame / fps, 6),
                 "sourcePlacementTime": round(source_frame / fps, 6),
                 "confidence": round(confidence, 6),
+                "placementRankingScore": round(ranking_score, 6),
                 "fraction": round(fraction, 6),
                 "cropXHint": hints["cropXHint"],
                 "scalePrior": hints["scalePrior"],
+                **diagnostics,
                 "scoreComponents": {key: round(float(value), 6) for key, value in features.items() if key != "bias"},
             }
         )
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (-float(item["confidence"]), int(item["referencePlacementFrame"]), int(item["sourcePlacementFrame"])))
+    candidates.sort(key=lambda item: (-float(item.get("placementRankingScore", item["confidence"])), int(item["referencePlacementFrame"]), int(item["sourcePlacementFrame"])))
     selected = candidates[0]
     retained_candidates = candidates[: max(1, min(int(top_k), len(candidates)))]
     return {
@@ -115,17 +146,30 @@ def placement_candidates_for_match(
         "scalePrior": selected["scalePrior"],
         "placementSampleCandidates": retained_candidates,
         "placementSampleCandidateCount": len(retained_candidates),
-        "placementCandidatePolicy": "ranked_fraction_samples",
+        "placementCandidatePolicy": "geometry_stable_ranked_fraction_samples",
+        "placementRankingMode": "geometry_stability_v1",
+        "placementDiagnostics": {
+            "cropOnlyAmbiguous": selected.get("cropOnlyAmbiguous"),
+            "cropOnlyAmbiguityScore": selected.get("cropOnlyAmbiguityScore"),
+            "geometryStabilityScore": selected.get("geometryStabilityScore"),
+            "transformTypeConfidence": selected.get("transformTypeConfidence"),
+            "xPlacementConfidence": selected.get("xPlacementConfidence"),
+            "yPlacementConfidence": selected.get("yPlacementConfidence"),
+            "scalePriorConfidence": selected.get("scalePriorConfidence"),
+        },
         "placementModel": placement_model_summary(model),
     }
 
 
 def pair_features(reference_image: Any, source_image: Any, fraction: float, duration: int) -> tuple[dict[str, float], dict[str, float]]:
     direct_score = frame_score(reference_image, resize_to_reference(source_image, reference_image))
-    crop_x, best_crop_score = best_crop_score_for_pair(reference_image, source_image)
+    crop_x, best_crop_score, crop_scores = best_crop_score_for_pair(reference_image, source_image)
     projection = best_projection_score_for_pair(reference_image, source_image)
+    affine = feature_affine_score_for_pair(reference_image, source_image)
     reference_edge = edge_density(reference_image)
     source_edge = edge_density(source_image)
+    crop_ambiguity = crop_ambiguity_score(crop_scores)
+    geometry_stability = geometry_stability_score(projection, affine, reference_edge, source_edge, crop_ambiguity)
     features = {
         "bias": 1.0,
         "fraction": float(fraction),
@@ -142,8 +186,12 @@ def pair_features(reference_image: Any, source_image: Any, fraction: float, dura
         "best_projection_scale": projection["scale_factor"],
         "best_projection_x": projection["x_offset"],
         "best_projection_y": projection["y_offset"],
+        "feature_affine_inlier_ratio": affine["inlier_ratio"],
+        "feature_affine_match_count": min(80.0, float(affine["match_count"])) / 80.0,
+        "crop_ambiguity_score": crop_ambiguity,
+        "geometry_stability_score": geometry_stability,
     }
-    return features, {"cropXHint": float(crop_x), "scalePrior": 1.0, "projectionHint": projection}
+    return features, {"cropXHint": float(crop_x), "scalePrior": 1.0, "projectionHint": projection, "cropScores": crop_scores, "affineHint": affine}
 
 
 def predict_confidence(model: dict[str, Any], features: dict[str, float]) -> float:
@@ -175,15 +223,116 @@ def heuristic_confidence(features: dict[str, float]) -> float:
     return max(0.0, min(1.0, (float(features["direct_score"]) * 0.35) + (float(features["best_crop_score"]) * 0.55) + (float(features["reference_edge_density"]) * 0.10)))
 
 
-def best_crop_score_for_pair(reference_frame: Any, source_frame: Any) -> tuple[float, float]:
+def placement_ranking_score(confidence: float, features: dict[str, float], duration: int, model: dict[str, Any] | None) -> float:
+    geometry_weight = float(model.get("geometry_stability_weight", 0.22) if isinstance(model, dict) else 0.22)
+    crop_penalty = float(model.get("crop_only_ambiguity_penalty", 0.18) if isinstance(model, dict) else 0.18)
+    short_weight = float(model.get("short_segment_geometry_weight", 0.18) if isinstance(model, dict) else 0.18)
+    geometry = float(features.get("geometry_stability_score", 0.0) or 0.0)
+    crop_ambiguity = float(features.get("crop_ambiguity_score", 0.0) or 0.0)
+    projection = float(features.get("best_projection_score", 0.0) or 0.0)
+    direct = float(features.get("direct_score", 0.0) or 0.0)
+    crop = float(features.get("best_crop_score", 0.0) or 0.0)
+    crop_only = max(0.0, crop - max(projection, direct))
+    score = float(confidence)
+    score += geometry_weight * geometry
+    score -= crop_penalty * max(crop_ambiguity, crop_only)
+    if duration <= 12:
+        score += short_weight * max(geometry, projection)
+        score -= 0.08 * float(features.get("near_boundary", 0.0) or 0.0)
+    return max(0.0, min(1.0, score))
+
+
+def placement_diagnostics(features: dict[str, float], hints: dict[str, Any], duration: int) -> dict[str, Any]:
+    projection = hints.get("projectionHint") if isinstance(hints.get("projectionHint"), dict) else {}
+    affine = hints.get("affineHint") if isinstance(hints.get("affineHint"), dict) else {}
+    crop_scores = hints.get("cropScores") if isinstance(hints.get("cropScores"), list) else []
+    projection_score = float(features.get("best_projection_score", 0.0) or 0.0)
+    crop_score = float(features.get("best_crop_score", 0.0) or 0.0)
+    direct_score = float(features.get("direct_score", 0.0) or 0.0)
+    geometry = float(features.get("geometry_stability_score", 0.0) or 0.0)
+    crop_ambiguity = float(features.get("crop_ambiguity_score", 0.0) or 0.0)
+    affine_ratio = float(features.get("feature_affine_inlier_ratio", 0.0) or 0.0)
+    affine_match_norm = float(features.get("feature_affine_match_count", 0.0) or 0.0)
+    crop_only_score = max(0.0, crop_score - max(projection_score, direct_score, affine_ratio))
+    crop_x = float(hints.get("cropXHint", 0.5) or 0.0)
+    if crop_x <= 0.25:
+        crop_direction = "left"
+    elif crop_x >= 0.75:
+        crop_direction = "right"
+    else:
+        crop_direction = "center"
+    affine_confidence = min(1.0, (affine_ratio * 0.7) + (affine_match_norm * 0.3))
+    projection_confidence = min(1.0, projection_score * 1.5)
+    crop_confidence = max(0.0, min(1.0, crop_score - (crop_ambiguity * 0.35) - (crop_only_score * 0.25)))
+    stable_confidence = max(projection_confidence, affine_confidence, geometry)
+    return {
+        "estimatedCropDirection": crop_direction,
+        "cropOnlyAmbiguous": bool(crop_ambiguity >= 0.65 or crop_only_score >= 0.12),
+        "cropOnlyAmbiguityScore": round(max(crop_ambiguity, crop_only_score), 6),
+        "geometryStabilityScore": round(geometry, 6),
+        "transformTypeConfidence": {
+            "featureAffine": round(affine_confidence, 6),
+            "projection": round(projection_confidence, 6),
+            "cropOnly": round(crop_confidence, 6),
+        },
+        "scalePriorConfidence": round(stable_confidence, 6),
+        "xPlacementConfidence": round(stable_confidence * (1.0 - min(0.85, crop_ambiguity * 0.65)), 6),
+        "yPlacementConfidence": round(max(projection_confidence, affine_confidence, direct_score), 6),
+        "shortSegmentPlacement": bool(duration <= 12),
+        "projectionHint": {
+            "score": round(float(projection.get("score", 0.0) or 0.0), 6),
+            "scaleFactor": round(float(projection.get("scale_factor", 1.0) or 1.0), 6),
+            "xOffset": round(float(projection.get("x_offset", 0.0) or 0.0), 6),
+            "yOffset": round(float(projection.get("y_offset", 0.0) or 0.0), 6),
+        },
+        "featureAffineHint": {
+            "matchCount": int(affine.get("match_count", 0) or 0),
+            "inlierCount": int(affine.get("inlier_count", 0) or 0),
+            "inlierRatio": round(float(affine.get("inlier_ratio", 0.0) or 0.0), 6),
+            "scaleFactor": round(float(affine.get("scale_factor", 1.0) or 1.0), 6),
+            "xOffset": round(float(affine.get("x_offset", 0.0) or 0.0), 6),
+            "yOffset": round(float(affine.get("y_offset", 0.0) or 0.0), 6),
+        },
+        "cropScoreSpread": [
+            {"cropX": round(float(item["crop_x"]), 6), "score": round(float(item["score"]), 6)}
+            for item in crop_scores
+        ],
+    }
+
+
+def best_crop_score_for_pair(reference_frame: Any, source_frame: Any) -> tuple[float, float, list[dict[str, float]]]:
     best_x = 0.5
     best_score = -1.0
+    scores: list[dict[str, float]] = []
     for crop_x in DEFAULT_CROP_X_FACTORS:
         score = frame_score(reference_frame, crop_9x16(source_frame, crop_x))
+        scores.append({"crop_x": float(crop_x), "score": float(score)})
         if score > best_score:
             best_x = crop_x
             best_score = score
-    return best_x, best_score
+    return best_x, best_score, scores
+
+
+def crop_ambiguity_score(crop_scores: list[dict[str, float]]) -> float:
+    if len(crop_scores) < 2:
+        return 0.0
+    ranked = sorted((float(item["score"]) for item in crop_scores), reverse=True)
+    best = ranked[0]
+    second = ranked[1]
+    if best <= 1e-6:
+        return 1.0
+    margin = max(0.0, best - second)
+    return round(max(0.0, min(1.0, 1.0 - (margin / max(0.12, best)))), 6)
+
+
+def geometry_stability_score(projection: dict[str, float], affine: dict[str, float], reference_edge: float, source_edge: float, crop_ambiguity: float) -> float:
+    projection_score = float(projection.get("score", 0.0) or 0.0)
+    affine_score = float(affine.get("inlier_ratio", 0.0) or 0.0)
+    affine_match_norm = min(1.0, float(affine.get("match_count", 0.0) or 0.0) / 80.0)
+    edge_score = max(0.0, min(1.0, (float(reference_edge) + float(source_edge)) * 18.0))
+    score = (projection_score * 0.45) + (affine_score * 0.30) + (affine_match_norm * 0.15) + (edge_score * 0.10)
+    score *= 1.0 - min(0.6, float(crop_ambiguity) * 0.35)
+    return round(max(0.0, min(1.0, score)), 6)
 
 
 def best_projection_score_for_pair(reference_frame: Any, source_frame: Any) -> dict[str, float]:
@@ -224,6 +373,61 @@ def best_projection_score_for_pair(reference_frame: Any, source_frame: Any) -> d
                         "y_offset": float(y_offset),
                     }
     return best
+
+
+def feature_affine_score_for_pair(reference_frame: Any, source_frame: Any) -> dict[str, float]:
+    reference = cv2.resize(reference_frame, COMPARE_SIZE, interpolation=cv2.INTER_AREA)
+    source = cv2.resize(source_frame, COMPARE_SIZE, interpolation=cv2.INTER_AREA)
+    reference_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)
+    source_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+    try:
+        detector = cv2.ORB_create(nfeatures=180, fastThreshold=12)
+        ref_keypoints, ref_descriptors = detector.detectAndCompute(reference_gray, None)
+        src_keypoints, src_descriptors = detector.detectAndCompute(source_gray, None)
+    except Exception:
+        return empty_affine_hint()
+    if ref_descriptors is None or src_descriptors is None or len(ref_keypoints) < 6 or len(src_keypoints) < 6:
+        return empty_affine_hint()
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    try:
+        matches = sorted(matcher.match(ref_descriptors, src_descriptors), key=lambda match: match.distance)
+    except Exception:
+        return empty_affine_hint()
+    if len(matches) < 6:
+        return empty_affine_hint(match_count=len(matches))
+    retained = matches[: min(80, len(matches))]
+    ref_points = np.float32([ref_keypoints[match.queryIdx].pt for match in retained]).reshape(-1, 1, 2)
+    src_points = np.float32([src_keypoints[match.trainIdx].pt for match in retained]).reshape(-1, 1, 2)
+    try:
+        matrix, inliers = cv2.estimateAffinePartial2D(src_points, ref_points, method=cv2.RANSAC, ransacReprojThreshold=4.0, maxIters=1000)
+    except Exception:
+        return empty_affine_hint(match_count=len(retained))
+    if matrix is None or inliers is None:
+        return empty_affine_hint(match_count=len(retained))
+    inlier_count = int(np.sum(inliers > 0))
+    inlier_ratio = inlier_count / max(1, len(retained))
+    scale_x = float(np.sqrt((matrix[0, 0] ** 2) + (matrix[0, 1] ** 2)))
+    scale_y = float(np.sqrt((matrix[1, 0] ** 2) + (matrix[1, 1] ** 2)))
+    scale_factor = (scale_x + scale_y) / 2.0
+    return {
+        "match_count": int(len(retained)),
+        "inlier_count": inlier_count,
+        "inlier_ratio": round(float(inlier_ratio), 6),
+        "scale_factor": round(float(scale_factor), 6),
+        "x_offset": round(float(matrix[0, 2]) / max(1, COMPARE_SIZE[0]), 6),
+        "y_offset": round(float(matrix[1, 2]) / max(1, COMPARE_SIZE[1]), 6),
+    }
+
+
+def empty_affine_hint(match_count: int = 0) -> dict[str, float]:
+    return {
+        "match_count": int(match_count),
+        "inlier_count": 0,
+        "inlier_ratio": 0.0,
+        "scale_factor": 1.0,
+        "x_offset": 0.0,
+        "y_offset": 0.0,
+    }
 
 
 def crop_9x16(frame: Any, crop_x: float) -> Any:
