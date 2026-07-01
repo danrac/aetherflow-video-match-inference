@@ -456,6 +456,31 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(result["matches"][0]["source_in"], 108)
             self.assertEqual(result["matches"][0]["source_out"], 138)
 
+    def test_source_window_match_uses_canonical_metadata_prior_when_present(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-metadata-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            correct_features = write_feature_manifest(root / "correct.features.json", "clip-a", [180.0, 10.0, 20.0], source_window={"source_in": 3, "source_out": 31})
+            visually_closer_features = write_feature_manifest(root / "wrong.features.json", "clip-b", [101.0, 121.0, 141.0], source_window={"source_in": 40, "source_out": 64})
+
+            result = match_source_windows(
+                SourceWindowMatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    model_manifest_path=str(model_manifest),
+                    reference_feature_manifest_path=str(reference_features),
+                    metadata={"canonical_reference_index": 2},
+                    candidates=(
+                        SourceWindowCandidate("candidate-a", "edit-001", "/tmp/a.mp4", "clip-a", str(correct_features), 3, 31, metadata={"source_reference_index": 2, "canonical_source_start_frame": 5}),
+                        SourceWindowCandidate("candidate-b", "edit-002", "/tmp/b.mp4", "clip-b", str(visually_closer_features), 40, 64, metadata={"source_reference_index": 9}),
+                    ),
+                )
+            )
+
+            self.assertEqual(result["ranking"]["top_candidates"][0]["candidate_id"], "edit-001")
+            self.assertTrue(result["ranking"]["top_candidates"][0]["canonicalMetadataPrior"]["matched"])
+            self.assertEqual(result["matches"][0]["source_in"], 5)
+
     def test_source_window_match_attaches_placement_to_ranked_candidates(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-ranked-placement-") as temp_dir:
             root = Path(temp_dir)

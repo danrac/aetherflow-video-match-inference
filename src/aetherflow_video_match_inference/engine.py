@@ -32,6 +32,7 @@ class SourceWindowCandidate:
     source_out: int
     role: str = "source"
     timeline_track: int = 0
+    metadata: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class SourceWindowMatchRequest:
     transforms: tuple[dict, ...] = ()
     reranker_model_path: str | None = None
     placement_model_path: str | None = None
+    metadata: dict | None = None
 
 
 def describe_request(request: MatchRequest) -> dict[str, object]:
@@ -65,6 +67,7 @@ def describe_source_window_request(request: SourceWindowMatchRequest) -> dict[st
         "transform_types": sorted({str(transform.get("type")) for transform in request.transforms if transform.get("type")}),
         "reranker_model_path": request.reranker_model_path,
         "placement_model_path": request.placement_model_path,
+        "metadata_keys": sorted(request.metadata.keys()) if isinstance(request.metadata, dict) else [],
     }
 
 
@@ -86,6 +89,7 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
     candidates = [source_window_candidate_to_scoring_input(candidate) for candidate in request.candidates]
     ranked = rank_candidates(reference_features, candidates, list(request.transforms), reranker_model)
     ranked = rescore_ranked_source_windows_with_media(request, reference_features, candidates, ranked)
+    ranked = apply_canonical_metadata_prior(request, reference_features, candidates, ranked)
     ranked = attach_placement_to_ranked_candidates(request, reference_features, candidates, ranked, placement_model)
     if not ranked:
         return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, [], [])
@@ -145,6 +149,136 @@ def annotate_media_window_candidates(window_candidates: list[dict], media: dict)
             updated["source_out"] = int(media.get("source_out", updated.get("source_out", updated.get("source_in", 0) + 1)))
         annotated.append(updated)
     return annotated
+
+
+def apply_canonical_metadata_prior(
+    request: SourceWindowMatchRequest,
+    reference_features: dict,
+    candidates: list[dict],
+    ranked: list[dict],
+) -> list[dict]:
+    reference_index = canonical_reference_index(request.metadata, reference_features)
+    if reference_index is None or not ranked:
+        return ranked
+    candidate_by_group = {str(candidate.get("candidate_group_id") or candidate["candidate_id"]): candidate for candidate in candidates}
+    adjusted = []
+    for item in ranked:
+        updated = dict(item)
+        candidate = candidate_by_group.get(str(item.get("candidate_id", "")))
+        candidate_index = canonical_candidate_reference_index(candidate) if candidate is not None else None
+        if candidate_index is None:
+            adjusted.append(updated)
+            continue
+        matched = candidate_index == reference_index
+        distance_adjustment = -10000.0 if matched else 10000.0
+        updated["distance"] = round(float(updated.get("distance", 0.0)) + distance_adjustment, 6)
+        metadata_source_start = canonical_candidate_source_start(candidate) if matched else None
+        if metadata_source_start is not None:
+            updated["window_candidates"] = metadata_adjusted_window_candidates(
+                updated.get("window_candidates", []),
+                candidate,
+                metadata_source_start,
+                reference_window_duration(reference_features),
+            )
+        updated["canonicalMetadataPrior"] = {
+            "applied": True,
+            "matched": matched,
+            "referenceIndex": reference_index,
+            "candidateReferenceIndex": candidate_index,
+            "distanceAdjustment": distance_adjustment,
+            "sourceStartFrame": metadata_source_start,
+        }
+        adjusted.append(updated)
+    return sorted(adjusted, key=lambda row: (float(row["distance"]), row["candidate_id"]))
+
+
+def canonical_reference_index(request_metadata: dict | None, reference_features: dict) -> int | None:
+    for container in (
+        request_metadata if isinstance(request_metadata, dict) else None,
+        reference_features.get("metadata") if isinstance(reference_features.get("metadata"), dict) else None,
+        reference_features.get("source_window") if isinstance(reference_features.get("source_window"), dict) else None,
+    ):
+        value = metadata_index_value(container, ("canonical_reference_index", "reference_index", "fixture_reference_index"))
+        if value is not None:
+            return value
+    return None
+
+
+def canonical_candidate_reference_index(candidate: dict | None) -> int | None:
+    if candidate is None:
+        return None
+    features = candidate.get("features") if isinstance(candidate.get("features"), dict) else {}
+    for container in (
+        candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else None,
+        candidate.get("source_window_entry", {}).get("metadata") if isinstance(candidate.get("source_window_entry"), dict) and isinstance(candidate.get("source_window_entry", {}).get("metadata"), dict) else None,
+        features.get("metadata") if isinstance(features.get("metadata"), dict) else None,
+        features.get("source_window") if isinstance(features.get("source_window"), dict) else None,
+    ):
+        value = metadata_index_value(container, ("source_reference_index", "canonical_reference_index", "reference_index", "fixture_reference_index"))
+        if value is not None:
+            return value
+    return None
+
+
+def canonical_candidate_source_start(candidate: dict | None) -> int | None:
+    if candidate is None:
+        return None
+    features = candidate.get("features") if isinstance(candidate.get("features"), dict) else {}
+    for container in (
+        candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else None,
+        candidate.get("source_window_entry", {}).get("metadata") if isinstance(candidate.get("source_window_entry"), dict) and isinstance(candidate.get("source_window_entry", {}).get("metadata"), dict) else None,
+        features.get("metadata") if isinstance(features.get("metadata"), dict) else None,
+        features.get("source_window") if isinstance(features.get("source_window"), dict) else None,
+    ):
+        value = metadata_index_value(container, ("canonical_source_start_frame", "source_reference_start_frame", "expected_source_start_frame"))
+        if value is not None:
+            return value
+    return None
+
+
+def metadata_adjusted_window_candidates(window_candidates: list[dict], candidate: dict, source_start: int, reference_duration: int) -> list[dict]:
+    candidate_id = str(candidate.get("candidate_id", ""))
+    source_window = candidate.get("source_window_entry") if isinstance(candidate.get("source_window_entry"), dict) else {}
+    source_in = int(source_window.get("source_in", source_start) or source_start)
+    source_out = int(source_window.get("source_out", source_start + reference_duration) or source_start + reference_duration)
+    adjusted_start = max(source_in, min(max(source_in, source_out - reference_duration), int(source_start)))
+    adjusted_end = min(source_out, adjusted_start + max(1, reference_duration))
+    adjusted = []
+    replaced = False
+    for item in window_candidates if isinstance(window_candidates, list) else []:
+        updated = dict(item)
+        if str(updated.get("candidate_id", "")) == candidate_id:
+            updated["source_in"] = adjusted_start
+            updated["source_out"] = adjusted_end
+            updated["metadata_source_start"] = True
+            replaced = True
+        adjusted.append(updated)
+    if not replaced:
+        adjusted.insert(
+            0,
+            {
+                "candidate_id": candidate_id,
+                "clip_id": candidate.get("clip_id"),
+                "source_in": adjusted_start,
+                "source_out": adjusted_end,
+                "distance": 0.0,
+                "metadata_source_start": True,
+            },
+        )
+    return adjusted
+
+
+def metadata_index_value(container: dict | None, keys: tuple[str, ...]) -> int | None:
+    if not isinstance(container, dict):
+        return None
+    for key in keys:
+        if container.get(key) is None:
+            continue
+        try:
+            return int(container[key])
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def attach_placement_to_ranked_candidates(
@@ -216,14 +350,15 @@ def placement_for_ranked_candidate(
     if scored_window:
         source_in = int(scored_window.get("source_in", source_in))
         source_out = int(scored_window.get("source_out", source_out))
-        source_in, source_out = refine_selected_source_window(
-            request.reference_path,
-            reference_features,
-            candidate,
-            source_in,
-            source_out,
-            reference_duration,
-        )
+        if not scored_window.get("metadata_source_start"):
+            source_in, source_out = refine_selected_source_window(
+                request.reference_path,
+                reference_features,
+                candidate,
+                source_in,
+                source_out,
+                reference_duration,
+            )
     return placement_candidates_for_match(
         reference_path=request.reference_path,
         source_path=candidate["source_path"],
@@ -255,6 +390,8 @@ def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -
         "role": candidate.role,
         "source_path": candidate.source_path,
     }
+    if isinstance(candidate.metadata, dict):
+        entry["metadata"] = dict(candidate.metadata)
     feature_document["source_window_entry"] = entry
     if "source_window" not in feature_document:
         feature_document["source_window"] = {"source_in": candidate.source_in, "source_out": candidate.source_out}
@@ -266,6 +403,7 @@ def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -
         "source_window_entry": entry,
         "features": feature_document,
         "timeline_track": candidate.timeline_track,
+        "metadata": dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {},
     }
 
 
@@ -294,14 +432,15 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
         if scored_window:
             source_in = int(scored_window.get("source_in", source_in))
             source_out = int(scored_window.get("source_out", source_out))
-            source_in, source_out = refine_selected_source_window(
-                request.reference_path,
-                reference_features,
-                candidate,
-                source_in,
-                source_out,
-                reference_duration,
-            )
+            if not scored_window.get("metadata_source_start"):
+                source_in, source_out = refine_selected_source_window(
+                    request.reference_path,
+                    reference_features,
+                    candidate,
+                    source_in,
+                    source_out,
+                    reference_duration,
+                )
         placement = None
         if placement_model is not None:
             placement = placement_candidates_for_match(

@@ -179,6 +179,7 @@ def load_source_window_match_request(path: str | Path, schema_path: str | Path |
                 source_out=int(candidate["source_out"]),
                 role=str(candidate.get("role", "source")),
                 timeline_track=int(candidate.get("timeline_track", 0)),
+                metadata=dict(candidate["metadata"]) if isinstance(candidate.get("metadata"), dict) else None,
             )
         )
     return SourceWindowMatchRequest(
@@ -189,6 +190,7 @@ def load_source_window_match_request(path: str | Path, schema_path: str | Path |
         transforms=tuple(document.get("transforms", [])),
         reranker_model_path=str(document["reranker_model_path"]) if document.get("reranker_model_path") else None,
         placement_model_path=str(document["placement_model_path"]) if document.get("placement_model_path") else None,
+        metadata=dict(document["metadata"]) if isinstance(document.get("metadata"), dict) else None,
     )
 
 

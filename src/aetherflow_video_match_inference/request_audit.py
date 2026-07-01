@@ -12,6 +12,7 @@ def audit_source_window_run(run_dir: str | Path, *, fixture_manifest_path: str |
     request_rows = load_request_rows(run_path)
     canonical_rows = load_canonical_reference_rows(fixture_manifest_path) if fixture_manifest_path else []
     selected_pairs = load_selected_pairs(run_path)
+    selected_sequence_match_count = selected_match_count(run_path, selected_pairs)
     short_rows = [row for row in request_rows if int(row["durationFrames"]) < 30]
     oversegmentation_ratio = round(len(request_rows) / max(1, len(canonical_rows)), 6) if canonical_rows else None
     status = "ok"
@@ -24,9 +25,9 @@ def audit_source_window_run(run_dir: str | Path, *, fixture_manifest_path: str |
     if short_rows:
         status = "segment_shape_mismatch" if status == "ok" else status
         findings.append(f"{len(short_rows)} reference requests are shorter than 30 frames.")
-    if selected_pairs and len(selected_pairs) > max(1, len(canonical_rows) if canonical_rows else len(request_rows)):
+    if selected_sequence_match_count is not None and selected_sequence_match_count > max(1, len(canonical_rows) if canonical_rows else len(request_rows)):
         status = "segment_shape_mismatch" if status == "ok" else status
-        findings.append(f"Sequence assignment selected {len(selected_pairs)} matches.")
+        findings.append(f"Sequence assignment selected {selected_sequence_match_count} matches.")
 
     return {
         "schemaVersion": "1.0.0",
@@ -38,7 +39,7 @@ def audit_source_window_run(run_dir: str | Path, *, fixture_manifest_path: str |
             "canonicalReferenceSegmentCount": len(canonical_rows) if canonical_rows else None,
             "cepReferenceRequestCount": len(request_rows),
             "shortReferenceRequestCount": len(short_rows),
-            "selectedSequenceMatchCount": len(selected_pairs) if selected_pairs else None,
+            "selectedSequenceMatchCount": selected_sequence_match_count,
             "oversegmentationRatio": oversegmentation_ratio,
             "allRequestsHavePlacementModelPath": all(row["placementModelPathPresent"] for row in request_rows) if request_rows else False,
             "candidateCounts": sorted({int(row["candidateCount"]) for row in request_rows}),
@@ -137,6 +138,33 @@ def load_selected_pairs(run_dir: Path) -> list[dict[str, Any]]:
     assignment = source_window.get("sequenceAssignment") if isinstance(source_window.get("sequenceAssignment"), dict) else {}
     pairs = assignment.get("selectedPairs")
     return pairs if isinstance(pairs, list) else []
+
+
+def selected_match_count(run_dir: Path, selected_pairs: list[dict[str, Any]]) -> int | None:
+    if selected_pairs:
+        return len(selected_pairs)
+    plan_path = run_dir / "footage_sync_match_plan.json"
+    if plan_path.exists():
+        plan = load_json_object(plan_path)
+        matcher = plan.get("matcher") if isinstance(plan.get("matcher"), dict) else {}
+        source_window = matcher.get("sourceWindow") if isinstance(matcher.get("sourceWindow"), dict) else {}
+        value = source_window.get("sequenceSelectedCount")
+        if value is not None:
+            return int(value)
+    report_path = run_dir / "footage_sync_match_report.json"
+    if report_path.exists():
+        report = load_json_object(report_path)
+        matches = report.get("matches")
+        if isinstance(matches, list):
+            return len(matches)
+    audit_path = run_dir / "footage_sync_candidate_audit.json"
+    if audit_path.exists():
+        audit = load_json_object(audit_path)
+        summary = audit.get("summary") if isinstance(audit.get("summary"), dict) else {}
+        value = summary.get("selectedMatchCount")
+        if value is not None:
+            return int(value)
+    return None
 
 
 def recommendation(status: str, canonical_rows: list[dict[str, Any]], request_rows: list[dict[str, Any]]) -> str:
