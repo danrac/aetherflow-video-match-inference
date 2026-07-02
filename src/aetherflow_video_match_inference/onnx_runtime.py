@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 
@@ -110,6 +111,230 @@ def linear_onnx_score(model: dict[str, Any], feature_values: list[float]) -> dic
             continue
     model["_last_onnx_runtime_error"] = str(last_error) if last_error else "no provider could load ONNX model"
     return None
+
+
+def validate_provider_route(
+    manifest_path: str | Path,
+    route_id: str,
+    provider: str,
+    smoke_input_path: str | Path | None = None,
+    tolerance: float = 1e-4,
+) -> dict[str, Any]:
+    """Validate that a routed artifact loads and runs on the requested provider."""
+
+    try:
+        import json
+        import numpy as np
+        import onnxruntime as ort
+    except ImportError as exc:
+        return {
+            "status": "failed",
+            "route": route_id,
+            "requestedProvider": provider,
+            "availableProviders": [],
+            "providerAvailable": False,
+            "actualProviders": [],
+            "usedProvider": None,
+            "cpuFallback": True,
+            "latencyMs": None,
+            "outputParity": {
+                "maxDeltaVsCpu": None,
+                "withinTolerance": False,
+                "tolerance": float(tolerance),
+            },
+            "stages": [],
+            "error": "onnxruntime and numpy are required to validate execution providers",
+            "exception": str(exc),
+        }
+
+    manifest_file = Path(manifest_path)
+    with manifest_file.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Expected manifest object at {manifest_file}")
+    route = runtime_route(manifest, route_id)
+    model_specs = route_model_specs(route)
+    if not model_specs:
+        raise ValueError(f"Route {route_id} does not declare ONNX scoring artifacts")
+
+    available = list(ort.get_available_providers())
+    provider_available = provider in available
+    stage_reports = []
+    cpu_fallback = False
+    total_start = perf_counter()
+    for spec in model_specs:
+        onnx_path = resolve_manifest_asset(manifest_file, spec["onnx"])
+        rows = smoke_rows_for_model(onnx_path, smoke_input_path, spec["stage"])
+        try:
+            provider_report = run_onnx_smoke(onnx_path, rows, provider, ["CPUExecutionProvider"], tolerance)
+        except Exception as exc:
+            provider_report = {
+                "onnxPath": str(onnx_path),
+                "requestedProvider": provider,
+                "actualProviders": [],
+                "usedProvider": None,
+                "cpuFallback": True,
+                "latencyMs": None,
+                "cpuLatencyMs": None,
+                "outputParity": {
+                    "maxDeltaVsCpu": None,
+                    "withinTolerance": False,
+                    "tolerance": float(tolerance),
+                },
+                "error": str(exc),
+            }
+        provider_report["stage"] = spec["stage"]
+        provider_report["artifact"] = spec["onnx"]
+        stage_reports.append(provider_report)
+        cpu_fallback = cpu_fallback or bool(provider_report["cpuFallback"])
+
+    latency_ms = round((perf_counter() - total_start) * 1000.0, 6)
+    used_provider = stage_reports[0]["usedProvider"] if stage_reports else None
+    within_tolerance = all(bool(stage["outputParity"]["withinTolerance"]) for stage in stage_reports)
+    status = "ok" if provider_available and not cpu_fallback and within_tolerance else "failed"
+    return {
+        "status": status,
+        "route": route_id,
+        "requestedProvider": provider,
+        "availableProviders": available,
+        "providerAvailable": provider_available,
+        "actualProviders": stage_reports[0]["actualProviders"] if stage_reports else [],
+        "usedProvider": used_provider,
+        "cpuFallback": cpu_fallback,
+        "latencyMs": latency_ms,
+        "outputParity": {
+            "maxDeltaVsCpu": max((float(stage["outputParity"]["maxDeltaVsCpu"]) for stage in stage_reports), default=None),
+            "withinTolerance": within_tolerance,
+            "tolerance": float(tolerance),
+        },
+        "stages": stage_reports,
+    }
+
+
+def runtime_route(manifest: dict[str, Any], route_id: str) -> dict[str, Any]:
+    routes = manifest.get("runtimeRoutes")
+    if isinstance(routes, dict) and isinstance(routes.get(route_id), dict):
+        return routes[route_id]
+    for route in manifest.get("routes", []):
+        if isinstance(route, dict) and str(route.get("route_id")) == route_id:
+            return route
+    raise ValueError(f"Unknown runtime route: {route_id}")
+
+
+def route_model_specs(route: dict[str, Any]) -> list[dict[str, str]]:
+    specs = []
+    for stage, key in (
+        ("reranker", "rerankerOnnx"),
+        ("reranker", "reranker_onnx_asset"),
+        ("placement", "placementOnnx"),
+    ):
+        value = route.get(key)
+        if value:
+            spec = {"stage": stage, "onnx": str(value)}
+            if spec not in specs:
+                specs.append(spec)
+    return specs
+
+
+def resolve_manifest_asset(manifest_path: Path, value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return manifest_path.parent / path
+
+
+def smoke_rows_for_model(onnx_path: Path, smoke_input_path: str | Path | None, stage: str) -> list[list[float]]:
+    if smoke_input_path:
+        import json
+
+        with Path(smoke_input_path).open("r", encoding="utf-8") as handle:
+            document = json.load(handle)
+        rows = rows_from_smoke_document(document, stage)
+        if rows:
+            return rows
+    width = onnx_input_width(onnx_path)
+    return [[float((index % 7) + 1) / 10.0 for index in range(width)]]
+
+
+def rows_from_smoke_document(document: Any, stage: str) -> list[list[float]]:
+    if isinstance(document, dict):
+        if isinstance(document.get("featureRows"), dict):
+            rows = document["featureRows"].get(stage)
+            if isinstance(rows, list):
+                return normalize_smoke_rows(rows)
+        for key in (stage, "features", "rows"):
+            if isinstance(document.get(key), list):
+                return normalize_smoke_rows(document[key])
+    if isinstance(document, list):
+        return normalize_smoke_rows(document)
+    return []
+
+
+def normalize_smoke_rows(rows: list[Any]) -> list[list[float]]:
+    if not rows:
+        return []
+    if all(isinstance(value, (int, float)) for value in rows):
+        return [[float(value) for value in rows]]
+    normalized = []
+    for row in rows:
+        if isinstance(row, list) and all(isinstance(value, (int, float)) for value in row):
+            normalized.append([float(value) for value in row])
+    return normalized
+
+
+def onnx_input_width(onnx_path: Path) -> int:
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise RuntimeError("onnxruntime is required to inspect ONNX input width") from exc
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    inputs = session.get_inputs()
+    if not inputs or len(inputs[0].shape) < 2:
+        raise ValueError(f"Cannot determine feature width for {onnx_path}")
+    width = inputs[0].shape[1]
+    if width in (None, "None"):
+        raise ValueError(f"Dynamic feature width is not supported for generated provider smoke input: {onnx_path}")
+    return int(width)
+
+
+def run_onnx_smoke(onnx_path: Path, rows: list[list[float]], provider: str, cpu_providers: list[str], tolerance: float) -> dict[str, Any]:
+    import numpy as np
+    import onnxruntime as ort
+
+    inputs = np.asarray(rows, dtype=np.float32)
+    provider_start = perf_counter()
+    provider_session = ort.InferenceSession(str(onnx_path), providers=[provider])
+    provider_inputs = provider_session.get_inputs()
+    provider_outputs = provider_session.get_outputs()
+    if not provider_inputs or not provider_outputs:
+        raise ValueError(f"ONNX model has no usable IO contract: {onnx_path}")
+    provider_result = provider_session.run([provider_outputs[0].name], {provider_inputs[0].name: inputs})[0]
+    provider_latency_ms = round((perf_counter() - provider_start) * 1000.0, 6)
+
+    cpu_start = perf_counter()
+    cpu_session = ort.InferenceSession(str(onnx_path), providers=cpu_providers)
+    cpu_inputs = cpu_session.get_inputs()
+    cpu_outputs = cpu_session.get_outputs()
+    cpu_result = cpu_session.run([cpu_outputs[0].name], {cpu_inputs[0].name: inputs})[0]
+    cpu_latency_ms = round((perf_counter() - cpu_start) * 1000.0, 6)
+
+    actual_providers = list(provider_session.get_providers())
+    used_provider = actual_providers[0] if actual_providers else None
+    max_delta = float(np.max(np.abs(np.asarray(provider_result, dtype=np.float32) - np.asarray(cpu_result, dtype=np.float32))))
+    return {
+        "onnxPath": str(onnx_path),
+        "requestedProvider": provider,
+        "actualProviders": actual_providers,
+        "usedProvider": used_provider,
+        "cpuFallback": used_provider != provider,
+        "latencyMs": provider_latency_ms,
+        "cpuLatencyMs": cpu_latency_ms,
+        "outputParity": {
+            "maxDeltaVsCpu": max_delta,
+            "withinTolerance": bool(max_delta <= tolerance),
+            "tolerance": float(tolerance),
+        },
+    }
 
 
 def validate_onnx_model(model_manifest_path: str | Path, model_manifest: dict[str, Any]) -> dict[str, Any]:

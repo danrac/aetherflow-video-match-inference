@@ -152,6 +152,41 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(report["inputs"][0]["name"], "features")
             self.assertEqual(report["outputs"][0]["name"], "scores")
 
+    def test_validate_provider_cli_reports_cpu_route_when_onnxruntime_is_available(self) -> None:
+        if importlib.util.find_spec("onnxruntime") is None:
+            self.skipTest("onnxruntime is not available in this Python runtime")
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-provider-") as temp_dir:
+            root = Path(temp_dir)
+            (root / "model.onnx").write_bytes(identity_onnx_model_bytes())
+            manifest = {
+                "schema_version": "0.3.1",
+                "model_id": "test-model",
+                "model_version": "v0001",
+                "runtimeRoutes": {
+                    "cpu_fallback": {
+                        "platform": "any",
+                        "preferredProvider": "CPUExecutionProvider",
+                        "rerankerOnnx": "model.onnx",
+                    }
+                },
+            }
+            manifest_path = root / "source_window_model_manifest.json"
+            write_json(manifest_path, manifest)
+            output = root / "provider-report.json"
+            exit_code = cli_main(
+                [
+                    "validate-provider",
+                    "--manifest",
+                    str(manifest_path),
+                    "--route",
+                    "cpu_fallback",
+                    "--provider",
+                    "CPUExecutionProvider",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+
     def test_sequence_assignment_penalizes_overlapping_source_reuse(self) -> None:
         rows = [
             sequence_row("reference-a", [sequence_candidate("source-a", 100, 160, 0.91)]),

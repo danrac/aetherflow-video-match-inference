@@ -7,9 +7,8 @@ import json
 from pathlib import Path
 
 from .adapters import to_host_payload
-from .engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, match, match_source_windows
 from .interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json
-from .onnx_runtime import validate_onnx_model, validate_reranker_onnx_model
+from .onnx_runtime import validate_onnx_model, validate_provider_route, validate_reranker_onnx_model
 from .request_audit import audit_source_window_run
 from .storage import inference_output_path
 
@@ -47,6 +46,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate_reranker.add_argument("--model", required=True)
     validate_reranker.add_argument("--onnx", required=True)
 
+    validate_provider = subcommands.add_parser("validate-provider")
+    validate_provider.add_argument("--manifest", required=True)
+    validate_provider.add_argument("--route", required=True)
+    validate_provider.add_argument("--provider", required=True)
+    validate_provider.add_argument("--smoke-input")
+    validate_provider.add_argument("--tolerance", type=float, default=1e-4)
+
     host = subcommands.add_parser("host-payload")
     host.add_argument("--match-result", required=True)
     host.add_argument("--host", required=True)
@@ -82,6 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "match":
+        from .engine import MatchRequest, match
+
         result = match(
             MatchRequest(
                 reference_path=args.reference,
@@ -97,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         print(output_path)
         return 0
     if args.command == "match-source-windows":
+        from .engine import match_source_windows
+
         request = load_source_window_match_request(args.request, schema_path=args.schema)
         result = match_source_windows(request)
         output_path = Path(args.output)
@@ -123,6 +133,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "validate-reranker-onnx":
         print(json.dumps(validate_reranker_onnx_model(args.model, args.onnx), indent=2, sort_keys=True))
         return 0
+    if args.command == "validate-provider":
+        report = validate_provider_route(
+            args.manifest,
+            route_id=args.route,
+            provider=args.provider,
+            smoke_input_path=args.smoke_input,
+            tolerance=args.tolerance,
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report.get("status") == "ok" else 2
     if args.command == "host-payload":
         with Path(args.match_result).open("r", encoding="utf-8") as handle:
             match_result = json.load(handle)
@@ -160,6 +180,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def load_source_window_match_request(path: str | Path, schema_path: str | Path | None = None) -> SourceWindowMatchRequest:
+    from .engine import SourceWindowCandidate, SourceWindowMatchRequest
+
     document = load_json_object(path)
     validate_source_window_request_document(path, schema_path, document)
     if not isinstance(document, dict):
