@@ -10,6 +10,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .onnx_runtime import linear_onnx_score
+
 
 FEATURE_NAMES = [
     "bias",
@@ -41,21 +43,29 @@ COMPARE_SIZE = (160, 284)
 def load_placement_model(path: str | Path | None) -> dict[str, Any] | None:
     if not path:
         return None
-    with Path(path).open("r", encoding="utf-8") as handle:
+    model_path = Path(path)
+    with model_path.open("r", encoding="utf-8") as handle:
         model = json.load(handle)
     if not isinstance(model, dict):
         raise ValueError(f"Expected placement model object at {path}")
+    model["_model_path"] = str(model_path)
     return model
 
 
 def placement_model_summary(model: dict[str, Any] | None) -> dict[str, Any] | None:
     if model is None:
         return None
-    return {
+    summary = {
         "model_id": model.get("model_id"),
         "model_version": model.get("model_version"),
         "model_type": model.get("model_type"),
     }
+    runtime = model.get("_last_onnx_runtime") or model.get("onnx_runtime")
+    if isinstance(runtime, dict):
+        summary["onnx_runtime"] = runtime
+    if model.get("_last_onnx_runtime_error"):
+        summary["onnx_runtime_error"] = model.get("_last_onnx_runtime_error")
+    return summary
 
 
 def placement_sample_offsets(fractions: list[Any], duration: int) -> list[tuple[float, int]]:
@@ -368,7 +378,29 @@ def predict_confidence(model: dict[str, Any], features: dict[str, float]) -> flo
         feature_names = FEATURE_NAMES
     means = model.get("feature_mean")
     stds = model.get("feature_std")
-    value = 0.0
+    values = placement_feature_values(features, feature_names, weights, means, stds)
+    onnx_result = linear_onnx_score(model, values)
+    if onnx_result is not None:
+        model["_last_onnx_runtime"] = {
+            "active": True,
+            "onnx_path": onnx_result["onnx_path"],
+            "requested_provider": onnx_result["requested_provider"],
+            "session_providers": onnx_result["session_providers"],
+        }
+        value = float(onnx_result["score"])
+    else:
+        model["_last_onnx_runtime"] = {
+            "active": False,
+            "fallback": "json_linear_weights",
+        }
+        value = sum(float(weights[index]) * values[index] for index in range(min(len(weights), len(values))))
+    confidence = sigmoid(value)
+    confidence -= float(model.get("boundary_penalty", 0.0) or 0.0) * float(features.get("near_boundary", 0.0) or 0.0)
+    return max(0.0, min(1.0, confidence))
+
+
+def placement_feature_values(features: dict[str, float], feature_names: list[Any], weights: list[Any], means: Any, stds: Any) -> list[float]:
+    values: list[float] = []
     for index, name in enumerate(feature_names[: len(weights)]):
         feature_value = float(features.get(str(name), 0.0))
         if isinstance(means, list) and isinstance(stds, list):
@@ -378,10 +410,8 @@ def predict_confidence(model: dict[str, Any], features: dict[str, float]) -> flo
                 std = float(stds[index]) if index < len(stds) and float(stds[index]) != 0.0 else 1.0
                 mean = float(means[index]) if index < len(means) else 0.0
                 feature_value = (feature_value - mean) / std
-        value += float(weights[index]) * feature_value
-    confidence = sigmoid(value)
-    confidence -= float(model.get("boundary_penalty", 0.0) or 0.0) * float(features.get("near_boundary", 0.0) or 0.0)
-    return max(0.0, min(1.0, confidence))
+        values.append(feature_value)
+    return values
 
 
 def heuristic_confidence(features: dict[str, float]) -> float:

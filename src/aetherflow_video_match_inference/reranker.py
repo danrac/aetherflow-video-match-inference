@@ -8,6 +8,7 @@ from math import isfinite, log1p, sqrt
 from pathlib import Path
 
 from .features import color_distance, temporal_signature_row
+from .onnx_runtime import linear_onnx_score
 
 FEATURE_NAMES = [
     "combined_visual",
@@ -25,7 +26,8 @@ MISSING_DISTANCE = 1000.0
 
 
 def load_reranker_model(path: str | Path) -> dict:
-    with Path(path).open("r", encoding="utf-8") as handle:
+    model_path = Path(path)
+    with model_path.open("r", encoding="utf-8") as handle:
         model = json.load(handle)
     if not isinstance(model, dict):
         raise ValueError(f"Expected reranker model object at {path}")
@@ -34,17 +36,24 @@ def load_reranker_model(path: str | Path) -> dict:
         raise ValueError(f"reranker model {path} does not contain {len(FEATURE_NAMES)} weights")
     model["weights"] = [float(value) for value in weights]
     model["bias"] = float(model.get("bias", 0.0))
+    model["_model_path"] = str(model_path)
     return model
 
 
 def reranker_model_summary(model: dict | None) -> dict | None:
     if model is None:
         return None
-    return {
+    summary = {
         "model_id": model.get("model_id"),
         "model_version": model.get("model_version"),
         "routing": model.get("routing"),
     }
+    runtime = model.get("_last_onnx_runtime") or model.get("onnx_runtime")
+    if isinstance(runtime, dict):
+        summary["onnx_runtime"] = runtime
+    if model.get("_last_onnx_runtime_error"):
+        summary["onnx_runtime_error"] = model.get("_last_onnx_runtime_error")
+    return summary
 
 
 def rank_candidates(reference_features: dict, candidates: list[dict], reference_transforms: list[dict] | None = None, reranker_model: dict | None = None) -> list[dict]:
@@ -181,6 +190,19 @@ def reranker_distance(components: dict, transform_types: set[str], baseline_dist
     if model is None or not use_learned_reranker(transform_types, model):
         return baseline_distance
     features = normalize_components(components)
+    onnx_result = linear_onnx_score(model, features)
+    if onnx_result is not None:
+        model["_last_onnx_runtime"] = {
+            "active": True,
+            "onnx_path": onnx_result["onnx_path"],
+            "requested_provider": onnx_result["requested_provider"],
+            "session_providers": onnx_result["session_providers"],
+        }
+        return float(onnx_result["score"])
+    model["_last_onnx_runtime"] = {
+        "active": False,
+        "fallback": "json_linear_weights",
+    }
     return sum(float(model["weights"][index]) * features[index] for index in range(len(FEATURE_NAMES))) + float(model.get("bias", 0.0))
 
 

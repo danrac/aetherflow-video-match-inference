@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
+
+
+_LINEAR_SESSION_CACHE: dict[tuple[str, tuple[str, ...]], Any] = {}
 
 
 def model_onnx_path(model_manifest_path: str | Path, model_manifest: dict[str, Any]) -> Path:
@@ -11,6 +15,101 @@ def model_onnx_path(model_manifest_path: str | Path, model_manifest: dict[str, A
     if onnx_path.is_absolute():
         return onnx_path
     return Path(model_manifest_path).parent / onnx_path
+
+
+def model_runtime_onnx_path(model: dict[str, Any]) -> Path | None:
+    """Resolve an ONNX path from a loaded JSON model object."""
+
+    runtime = model.get("onnx_runtime") if isinstance(model.get("onnx_runtime"), dict) else {}
+    path_value = (
+        runtime.get("onnx_path")
+        or runtime.get("model_path")
+        or model.get("onnx_path")
+        or model.get("onnxPath")
+    )
+    if not path_value:
+        return None
+    path = Path(str(path_value))
+    if path.is_absolute():
+        return path
+    model_path = model.get("_model_path")
+    if model_path:
+        return Path(str(model_path)).parent / path
+    return path
+
+
+def preferred_provider_sequence(model: dict[str, Any] | None = None) -> list[str]:
+    """Return the provider preference requested by env/model metadata."""
+
+    env_value = os.environ.get("AETHERFLOW_ONNX_PROVIDERS") or os.environ.get("AETHERFLOW_ONNX_PROVIDER")
+    if env_value:
+        providers = [item.strip() for item in env_value.split(",") if item.strip()]
+    else:
+        runtime = model.get("onnx_runtime") if isinstance(model, dict) and isinstance(model.get("onnx_runtime"), dict) else {}
+        provider = (
+            runtime.get("preferred_provider")
+            or runtime.get("preferredProvider")
+            or (model.get("preferred_provider") if isinstance(model, dict) else None)
+            or (model.get("preferredProvider") if isinstance(model, dict) else None)
+        )
+        providers = [str(provider)] if provider else []
+    if "CPUExecutionProvider" not in providers:
+        providers.append("CPUExecutionProvider")
+    return providers
+
+
+def linear_onnx_score(model: dict[str, Any], feature_values: list[float]) -> dict[str, Any] | None:
+    """Run a linear `features -> scores` ONNX model when available.
+
+    Returns None when ONNX Runtime or the referenced model is unavailable so the
+    caller can use the deterministic JSON scorer fallback.
+    """
+
+    if os.environ.get("AETHERFLOW_ONNX_DISABLE") in {"1", "true", "TRUE", "yes", "YES"}:
+        return None
+    onnx_path = model_runtime_onnx_path(model)
+    if onnx_path is None or not onnx_path.exists():
+        return None
+    try:
+        import numpy as np
+        import onnxruntime as ort
+    except ImportError:
+        return None
+
+    available = set(ort.get_available_providers())
+    requested = preferred_provider_sequence(model)
+    provider_attempts = [provider for provider in requested if provider in available]
+    if "CPUExecutionProvider" not in provider_attempts and "CPUExecutionProvider" in available:
+        provider_attempts.append("CPUExecutionProvider")
+    if not provider_attempts:
+        return None
+
+    last_error: Exception | None = None
+    for provider in provider_attempts:
+        cache_key = (str(onnx_path), (provider,))
+        try:
+            session = _LINEAR_SESSION_CACHE.get(cache_key)
+            if session is None:
+                session = ort.InferenceSession(str(onnx_path), providers=[provider])
+                _LINEAR_SESSION_CACHE[cache_key] = session
+            inputs = session.get_inputs()
+            outputs = session.get_outputs()
+            if not inputs or not outputs:
+                return None
+            row = np.asarray(feature_values, dtype=np.float32).reshape(1, -1)
+            observed = session.run([outputs[0].name], {inputs[0].name: row})[0]
+            return {
+                "score": float(np.asarray(observed).reshape(-1)[0]),
+                "onnx_path": str(onnx_path),
+                "requested_provider": provider,
+                "session_providers": list(session.get_providers()),
+                "available_providers": sorted(available),
+            }
+        except Exception as exc:  # pragma: no cover - provider-specific failures need target runtimes.
+            last_error = exc
+            continue
+    model["_last_onnx_runtime_error"] = str(last_error) if last_error else "no provider could load ONNX model"
+    return None
 
 
 def validate_onnx_model(model_manifest_path: str | Path, model_manifest: dict[str, Any]) -> dict[str, Any]:
