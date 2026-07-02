@@ -30,6 +30,12 @@ def build_parser() -> argparse.ArgumentParser:
     source_windows.add_argument("--output", required=True)
     source_windows.add_argument("--schema")
 
+    source_windows_batch = subcommands.add_parser("match-source-windows-batch")
+    source_windows_batch.add_argument("--request", action="append", default=[])
+    source_windows_batch.add_argument("--request-dir")
+    source_windows_batch.add_argument("--output", required=True)
+    source_windows_batch.add_argument("--schema")
+
     validate_source_window = subcommands.add_parser("validate-source-window-request")
     validate_source_window.add_argument("--request", required=True)
     validate_source_window.add_argument("--schema")
@@ -112,6 +118,36 @@ def main(argv: list[str] | None = None) -> int:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(output_path)
+        return 0
+    if args.command == "match-source-windows-batch":
+        from .engine import match_source_windows
+
+        request_paths = source_window_batch_request_paths(args.request, args.request_dir)
+        results = []
+        total_latency = 0.0
+        for request_path in request_paths:
+            request = load_source_window_match_request(request_path, schema_path=args.schema)
+            result = match_source_windows(request)
+            total_latency += float(result.get("performance", {}).get("totalLatencyMs", 0.0) or 0.0)
+            results.append({"request_path": str(request_path), "result": result})
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "0.1.0",
+                    "request_count": len(results),
+                    "total_match_latency_ms": round(total_latency, 6),
+                    "average_match_latency_ms": round(total_latency / len(results), 6) if results else 0.0,
+                    "results": results,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         print(output_path)
         return 0
     if args.command == "validate-source-window-request":
@@ -214,6 +250,24 @@ def load_source_window_match_request(path: str | Path, schema_path: str | Path |
         placement_model_path=str(document["placement_model_path"]) if document.get("placement_model_path") else None,
         metadata=dict(document["metadata"]) if isinstance(document.get("metadata"), dict) else None,
     )
+
+
+def source_window_batch_request_paths(explicit_paths: list[str], request_dir: str | None) -> list[Path]:
+    paths = [Path(path) for path in explicit_paths]
+    if request_dir:
+        root = Path(request_dir)
+        paths.extend(sorted(root.rglob("source_window_request.json")))
+    seen: set[str] = set()
+    unique = []
+    for path in paths:
+        resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    if not unique:
+        raise ValueError("match-source-windows-batch requires --request or --request-dir")
+    return unique
 
 
 def validate_source_window_request_document(path: str | Path, schema_path: str | Path | None = None, document: dict | None = None) -> None:

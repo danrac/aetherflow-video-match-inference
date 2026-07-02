@@ -108,6 +108,22 @@ def placement_candidates_for_match(
 ) -> dict[str, Any] | None:
     if reference_duration <= 2 or source_duration <= 2:
         return None
+    recommended_transform = recommended_transform_candidate(
+        reference_path=reference_path,
+        source_path=source_path,
+        request_metadata=request_metadata,
+        candidate_metadata=candidate_metadata,
+    )
+    if recommended_transform is not None and use_recommended_transform_fast_path(model, request_metadata, candidate_metadata):
+        return recommended_transform_fast_placement(
+            recommended_transform=recommended_transform,
+            reference_start_frame=reference_start_frame,
+            reference_duration=reference_duration,
+            source_start_frame=source_start_frame,
+            source_duration=source_duration,
+            fps=fps,
+            model=model,
+        )
     fractions = model.get("sample_fractions") if isinstance(model, dict) else None
     if not isinstance(fractions, list) or not fractions:
         fractions = DEFAULT_SAMPLE_FRACTIONS
@@ -148,12 +164,6 @@ def placement_candidates_for_match(
     candidates.sort(key=lambda item: (-float(item.get("placementRankingScore", item["confidence"])), int(item["referencePlacementFrame"]), int(item["sourcePlacementFrame"])))
     selected = candidates[0]
     retained_candidates = candidates[: max(1, min(int(top_k), len(candidates)))]
-    recommended_transform = recommended_transform_candidate(
-        reference_path=reference_path,
-        source_path=source_path,
-        request_metadata=request_metadata,
-        candidate_metadata=candidate_metadata,
-    )
     placement = {
         "referencePlacementFrame": selected["referencePlacementFrame"],
         "sourcePlacementFrame": selected["sourcePlacementFrame"],
@@ -181,6 +191,104 @@ def placement_candidates_for_match(
         placement["recommendedTransformCandidate"] = recommended_transform
         placement["recommendedTransformPolicy"] = recommended_transform["policy"]
     return placement
+
+
+def use_recommended_transform_fast_path(
+    model: dict[str, Any] | None,
+    request_metadata: dict[str, Any] | None,
+    candidate_metadata: dict[str, Any] | None,
+) -> bool:
+    if isinstance(model, dict) and model.get("disable_recommended_transform_fast_path"):
+        return False
+    if isinstance(model, dict) and model.get("recommended_transform_fast_path") is True:
+        return True
+    metadata = merged_transform_metadata(request_metadata, candidate_metadata)
+    explicit = first_mapping(metadata, ("canonical_placement_transform", "placement_transform", "recommended_transform"))
+    if explicit is not None and float(explicit.get("confidence", 1.0) or 1.0) >= 0.98:
+        return True
+    return first_mapping(metadata, ("canonical_editor_transform", "editor_transform", "transform")) is not None and bool(metadata.get("canonical_reference_index") is not None or metadata.get("source_reference_index") is not None)
+
+
+def recommended_transform_fast_placement(
+    *,
+    recommended_transform: dict[str, Any],
+    reference_start_frame: int,
+    reference_duration: int,
+    source_start_frame: int,
+    source_duration: int,
+    fps: float,
+    model: dict[str, Any] | None,
+) -> dict[str, Any]:
+    duration = max(1, min(reference_duration, source_duration))
+    fractions = model.get("sample_fractions") if isinstance(model, dict) else None
+    if not isinstance(fractions, list) or not fractions:
+        fractions = [0.5]
+    sample_offsets = placement_sample_offsets(fractions, duration)[: max(1, min(4, len(fractions)))]
+    candidates = []
+    for fraction, offset in sample_offsets:
+        reference_frame = int(reference_start_frame + offset)
+        source_frame = int(source_start_frame + offset)
+        candidates.append(
+            {
+                "referencePlacementFrame": reference_frame,
+                "sourcePlacementFrame": source_frame,
+                "referencePlacementTime": round(reference_frame / fps, 6),
+                "sourcePlacementTime": round(source_frame / fps, 6),
+                "confidence": 1.0,
+                "placementRankingScore": 1.0,
+                "fraction": round(float(fraction), 6),
+                "cropXHint": None,
+                "scalePrior": None,
+                "estimatedCropDirection": "model_recommended_transform",
+                "cropOnlyAmbiguous": False,
+                "cropOnlyAmbiguityScore": 0.0,
+                "geometryStabilityScore": 1.0,
+                "transformTypeConfidence": {
+                    "featureAffine": 0.0,
+                    "projection": 0.0,
+                    "cropOnly": 0.0,
+                    "modelRecommendedTransform": 1.0,
+                },
+                "scalePriorConfidence": 1.0,
+                "xPlacementConfidence": 1.0,
+                "yPlacementConfidence": 1.0,
+                "shortSegmentPlacement": bool(duration <= 12),
+                "scoreComponents": {},
+            }
+        )
+    selected = candidates[0]
+    return {
+        "referencePlacementFrame": selected["referencePlacementFrame"],
+        "sourcePlacementFrame": selected["sourcePlacementFrame"],
+        "referencePlacementTime": selected["referencePlacementTime"],
+        "sourcePlacementTime": selected["sourcePlacementTime"],
+        "placementFrameConfidence": 1.0,
+        "cropXHint": selected["cropXHint"],
+        "scalePrior": selected["scalePrior"],
+        "placementSampleCandidates": candidates,
+        "placementSampleCandidateCount": len(candidates),
+        "placementCandidatePolicy": "model_recommended_transform_fast_path",
+        "placementRankingMode": "recommended_transform_fast_path_v1",
+        "placementDiagnostics": {
+            "cropOnlyAmbiguous": False,
+            "cropOnlyAmbiguityScore": 0.0,
+            "geometryStabilityScore": 1.0,
+            "transformTypeConfidence": selected["transformTypeConfidence"],
+            "xPlacementConfidence": 1.0,
+            "yPlacementConfidence": 1.0,
+            "scalePriorConfidence": 1.0,
+            "accelerated": True,
+            "cpuOpenCvRegistrationSkipped": True,
+        },
+        "placementModel": placement_model_summary(model),
+        "recommendedTransformCandidate": recommended_transform,
+        "recommendedTransformPolicy": recommended_transform["policy"],
+        "acceleration": {
+            "stage": "placement_candidate_generation",
+            "mode": "model_recommended_transform_fast_path",
+            "cpuOpenCvRegistrationSkipped": True,
+        },
+    }
 
 
 def recommended_transform_candidate(

@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from time import perf_counter
 
 from .features import color_distance, confidence_from_distance, load_feature_manifest
 from .media_window import media_window_rescore, refine_boundary_start
@@ -82,17 +83,19 @@ def load_model_manifest(path: str | Path) -> dict:
 def match_source_windows(request: SourceWindowMatchRequest) -> dict:
     """Rank explicit grouped source-window candidates and reconstruct timeline edits."""
 
+    timings: list[dict[str, float | str]] = []
+    total_start = perf_counter()
     model_manifest = load_model_manifest(request.model_manifest_path)
-    reference_features = load_feature_manifest(request.reference_feature_manifest_path)
-    reranker_model = load_reranker_model(request.reranker_model_path) if request.reranker_model_path else None
-    placement_model = load_placement_model(request.placement_model_path) if request.placement_model_path else None
-    candidates = [source_window_candidate_to_scoring_input(candidate) for candidate in request.candidates]
-    ranked = rank_candidates(reference_features, candidates, list(request.transforms), reranker_model)
-    ranked = rescore_ranked_source_windows_with_media(request, reference_features, candidates, ranked)
-    ranked = apply_canonical_metadata_prior(request, reference_features, candidates, ranked)
-    ranked = attach_placement_to_ranked_candidates(request, reference_features, candidates, ranked, placement_model)
+    reference_features = timed_stage(timings, "feature_loading.reference", lambda: load_feature_manifest(request.reference_feature_manifest_path))
+    reranker_model = timed_stage(timings, "model_loading.reranker", lambda: load_reranker_model(request.reranker_model_path) if request.reranker_model_path else None)
+    placement_model = timed_stage(timings, "model_loading.placement", lambda: load_placement_model(request.placement_model_path) if request.placement_model_path else None)
+    candidates = timed_stage(timings, "feature_loading.candidates", lambda: [source_window_candidate_to_scoring_input(candidate) for candidate in request.candidates])
+    ranked = timed_stage(timings, "source_window_scoring", lambda: rank_candidates(reference_features, candidates, list(request.transforms), reranker_model))
+    ranked = timed_stage(timings, "media_window_rescore", lambda: rescore_ranked_source_windows_with_media(request, reference_features, candidates, ranked))
+    ranked = timed_stage(timings, "canonical_metadata_prior", lambda: apply_canonical_metadata_prior(request, reference_features, candidates, ranked))
+    ranked = timed_stage(timings, "placement_candidate_generation", lambda: attach_placement_to_ranked_candidates(request, reference_features, candidates, ranked, placement_model))
     if not ranked:
-        return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, [], [])
+        return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, [], [], timings, total_start)
 
     selected_group_id = str(ranked[0]["candidate_id"])
     selected_candidates = [
@@ -101,8 +104,15 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
         if str(candidate.get("candidate_group_id") or candidate["candidate_id"]) == selected_group_id
     ]
     selected_candidates.sort(key=lambda candidate: (candidate["source_window_entry"].get("role", ""), int(candidate["source_window_entry"].get("source_in", 0)), candidate["candidate_id"]))
-    selected_matches = source_window_matches_from_candidates(request, reference_features, selected_candidates, ranked[0], placement_model)
-    return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, ranked, selected_matches)
+    selected_matches = timed_stage(timings, "timeline_reconstruction", lambda: source_window_matches_from_candidates(request, reference_features, selected_candidates, ranked[0], placement_model))
+    return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, ranked, selected_matches, timings, total_start)
+
+
+def timed_stage(timings: list[dict[str, float | str]], stage: str, callback):
+    start = perf_counter()
+    result = callback()
+    timings.append({"stage": stage, "latencyMs": round((perf_counter() - start) * 1000.0, 6)})
+    return result
 
 
 def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], ranked: list[dict]) -> list[dict]:
@@ -486,8 +496,22 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
     return matches
 
 
-def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict, reference_features: dict, reranker_model: dict | None, placement_model: dict | None, ranked: list[dict], matches: list[dict]) -> dict:
+def source_window_result(
+    request: SourceWindowMatchRequest,
+    model_manifest: dict,
+    reference_features: dict,
+    reranker_model: dict | None,
+    placement_model: dict | None,
+    ranked: list[dict],
+    matches: list[dict],
+    timings: list[dict[str, float | str]] | None = None,
+    total_start: float | None = None,
+) -> dict:
     diagnostics = source_window_diagnostics(request, reference_features, ranked, matches)
+    performance = {
+        "totalLatencyMs": round((perf_counter() - total_start) * 1000.0, 6) if total_start is not None else None,
+        "stages": timings or [],
+    }
     return {
         "schema_version": "0.1.0",
         "model_id": model_manifest["model_id"],
@@ -503,6 +527,7 @@ def source_window_result(request: SourceWindowMatchRequest, model_manifest: dict
             "reranker_model": reranker_model_summary(reranker_model),
             "placement_model": placement_model_summary(placement_model),
         },
+        "performance": performance,
         "diagnostics": diagnostics,
         "matches": matches,
     }

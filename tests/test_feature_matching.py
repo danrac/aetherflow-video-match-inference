@@ -16,7 +16,7 @@ from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCa
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
-from aetherflow_video_match_inference.placement import pair_features, placement_diagnostics, placement_ranking_score, placement_sample_offsets, recommended_transform_candidate
+from aetherflow_video_match_inference.placement import pair_features, placement_candidates_for_match, placement_diagnostics, placement_ranking_score, placement_sample_offsets, recommended_transform_candidate
 from aetherflow_video_match_inference.sequence_assignment import assign_ranked_reference_sequence
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
@@ -650,6 +650,29 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertAlmostEqual(transform["position"][1], 1005.847242, places=3)
         self.assertAlmostEqual(transform["scale"], 192.485622, places=3)
 
+    def test_recommended_transform_fast_path_skips_frame_reads(self) -> None:
+        placement = placement_candidates_for_match(
+            reference_path="/tmp/missing-reference.mp4",
+            source_path="/tmp/missing-source.mp4",
+            reference_start_frame=10,
+            reference_duration=30,
+            source_start_frame=40,
+            source_duration=30,
+            fps=30.0,
+            model={"model_id": "test-placement", "recommended_transform_fast_path": True, "sample_fractions": [0.5]},
+            request_metadata={"target_size": [1080, 1920]},
+            candidate_metadata={
+                "source_size": [1920, 1080],
+                "placement_transform": {"position": [540, 960], "scale": 177.777778, "confidence": 1.0},
+            },
+        )
+
+        self.assertIsNotNone(placement)
+        assert placement is not None
+        self.assertEqual(placement["placementCandidatePolicy"], "model_recommended_transform_fast_path")
+        self.assertTrue(placement["placementDiagnostics"]["cpuOpenCvRegistrationSkipped"])
+        self.assertEqual(placement["recommendedTransformCandidate"]["position"], [540.0, 960.0])
+
     def test_cli_runs_source_window_match_from_json_request(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-cli-") as temp_dir:
             root = Path(temp_dir)
@@ -691,6 +714,46 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(result["diagnostics"]["rankedCandidates"][0]["candidateSourceSegmentId"], "edit-001")
             self.assertTrue(result["diagnostics"]["rankedCandidates"][0]["selected"])
             self.assertEqual(result["diagnostics"]["globalAssignment"]["assignmentMethod"], "per_reference_ranking")
+
+    def test_cli_runs_source_window_batch_from_request_dir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-batch-cli-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            request_root = root / "_source_window_match" / "reference_a"
+            request_root.mkdir(parents=True)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source_features = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            request_path = request_root / "source_window_request.json"
+            output_path = root / "batch.json"
+            write_json(
+                request_path,
+                {
+                    "schema_version": "0.1.0",
+                    "reference_path": "/tmp/reference.mp4",
+                    "model_manifest_path": str(model_manifest),
+                    "reference_feature_manifest_path": str(reference_features),
+                    "transforms": [],
+                    "candidates": [
+                        {
+                            "candidate_id": "candidate-a",
+                            "candidate_group_id": "edit-001",
+                            "source_path": "/tmp/a.mp4",
+                            "source_clip_id": "clip-a",
+                            "feature_manifest_path": str(source_features),
+                            "source_in": 3,
+                            "source_out": 27,
+                        }
+                    ],
+                },
+            )
+
+            exit_code = cli_main(["match-source-windows-batch", "--request-dir", str(root / "_source_window_match"), "--output", str(output_path)])
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(result["request_count"], 1)
+            self.assertEqual(result["results"][0]["result"]["matches"][0]["source_in"], 3)
+            self.assertIn("total_match_latency_ms", result)
 
     def test_cli_validates_source_window_request_schema(self) -> None:
         schema_path = CONTRACTS_ROOT / "schemas" / "source_window_match_request.schema.json"
