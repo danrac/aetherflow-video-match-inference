@@ -187,6 +187,41 @@ class FeatureMatchingTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
 
+    def test_validate_provider_cli_reports_visual_encoder_stage(self) -> None:
+        if importlib.util.find_spec("onnxruntime") is None:
+            self.skipTest("onnxruntime is not available in this Python runtime")
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-provider-visual-") as temp_dir:
+            root = Path(temp_dir)
+            (root / "visual_encoder.onnx").write_bytes(image_identity_onnx_model_bytes())
+            manifest = {
+                "schema_version": "0.3.1",
+                "model_id": "test-model",
+                "model_version": "v0001",
+                "runtimeRoutes": {
+                    "cpu_fallback": {
+                        "platform": "any",
+                        "preferredProvider": "CPUExecutionProvider",
+                        "visualEncoderOnnx": "visual_encoder.onnx",
+                    }
+                },
+            }
+            manifest_path = root / "source_window_model_manifest.json"
+            write_json(manifest_path, manifest)
+
+            exit_code = cli_main(
+                [
+                    "validate-provider",
+                    "--manifest",
+                    str(manifest_path),
+                    "--route",
+                    "cpu_fallback",
+                    "--provider",
+                    "CPUExecutionProvider",
+                ]
+            )
+
+            self.assertEqual(exit_code, 0)
+
     def test_sequence_assignment_penalizes_overlapping_source_reuse(self) -> None:
         rows = [
             sequence_row("reference-a", [sequence_candidate("source-a", 100, 160, 0.91)]),
@@ -1528,6 +1563,53 @@ def identity_onnx_model_bytes() -> bytes:
     graph = message_field(1, node) + string_field(2, "aetherflow_video_match_baseline") + message_field(11, value_info("features")) + message_field(12, value_info("scores"))
     opset = string_field(1, "") + int_field(2, 13)
     return int_field(1, 8) + string_field(2, "aetherflow-video-match-training") + message_field(7, graph) + message_field(8, opset)
+
+
+def image_identity_onnx_model_bytes() -> bytes:
+    def varint(value: int) -> bytes:
+        output = []
+        while True:
+            byte = value & 0x7F
+            value >>= 7
+            if value:
+                output.append(byte | 0x80)
+            else:
+                output.append(byte)
+                break
+        return bytes(output)
+
+    def key(field_number: int, wire_type: int) -> bytes:
+        return varint((field_number << 3) | wire_type)
+
+    def int_field(field_number: int, value: int) -> bytes:
+        return key(field_number, 0) + varint(value)
+
+    def string_field(field_number: int, value: str) -> bytes:
+        encoded = value.encode("utf-8")
+        return key(field_number, 2) + varint(len(encoded)) + encoded
+
+    def message_field(field_number: int, value: bytes) -> bytes:
+        return key(field_number, 2) + varint(len(value)) + value
+
+    def dimension(value: int) -> bytes:
+        return int_field(1, value)
+
+    def tensor_shape() -> bytes:
+        return b"".join(message_field(1, dimension(value)) for value in (1, 3, 2, 2))
+
+    def tensor_type() -> bytes:
+        return int_field(1, 1) + message_field(2, tensor_shape())
+
+    def type_proto() -> bytes:
+        return message_field(1, tensor_type())
+
+    def value_info(name: str) -> bytes:
+        return string_field(1, name) + message_field(2, type_proto())
+
+    node = string_field(1, "pixel_values") + string_field(2, "image_embeds") + string_field(3, "image_identity") + string_field(4, "Identity")
+    graph = message_field(1, node) + string_field(2, "aetherflow_visual_encoder_smoke") + message_field(11, value_info("pixel_values")) + message_field(12, value_info("image_embeds"))
+    opset = string_field(1, "") + int_field(2, 13)
+    return int_field(1, 8) + string_field(2, "aetherflow-video-match-inference") + message_field(7, graph) + message_field(8, opset)
 
 
 def validate_schema_subset(document, schema: dict, path: str = "$") -> list[str]:

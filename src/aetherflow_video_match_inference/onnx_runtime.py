@@ -9,6 +9,8 @@ from typing import Any
 
 
 _LINEAR_SESSION_CACHE: dict[tuple[str, tuple[str, ...]], Any] = {}
+_VISUAL_ENCODER_COSINE_THRESHOLD = 0.995
+_ACCELERATED_EVENT_RATIO_THRESHOLD = 0.50
 
 
 def model_onnx_path(model_manifest_path: str | Path, model_manifest: dict[str, Any]) -> Path:
@@ -156,6 +158,7 @@ def validate_provider_route(
     model_specs = route_model_specs(route)
     if not model_specs:
         raise ValueError(f"Route {route_id} does not declare ONNX scoring artifacts")
+    effective_tolerance = float(route.get("providerValidationTolerance", tolerance))
 
     available = list(ort.get_available_providers())
     provider_available = provider in available
@@ -164,9 +167,12 @@ def validate_provider_route(
     total_start = perf_counter()
     for spec in model_specs:
         onnx_path = resolve_manifest_asset(manifest_file, spec["onnx"])
-        rows = smoke_rows_for_model(onnx_path, smoke_input_path, spec["stage"])
         try:
-            provider_report = run_onnx_smoke(onnx_path, rows, provider, ["CPUExecutionProvider"], tolerance)
+            if spec.get("kind") == "visual_encoder":
+                provider_report = run_visual_encoder_smoke(onnx_path, provider, ["CPUExecutionProvider"], spec.get("provider_options"))
+            else:
+                rows = smoke_rows_for_model(onnx_path, smoke_input_path, spec["stage"])
+                provider_report = run_onnx_smoke(onnx_path, rows, provider, ["CPUExecutionProvider"], effective_tolerance)
         except Exception as exc:
             provider_report = {
                 "onnxPath": str(onnx_path),
@@ -192,6 +198,11 @@ def validate_provider_route(
     used_provider = stage_reports[0]["usedProvider"] if stage_reports else None
     within_tolerance = all(bool(stage["outputParity"]["withinTolerance"]) for stage in stage_reports)
     status = "ok" if provider_available and not cpu_fallback and within_tolerance else "failed"
+    cosine_values = [
+        float(stage["outputParity"]["cosineSimilarityVsCpu"])
+        for stage in stage_reports
+        if stage.get("outputParity", {}).get("cosineSimilarityVsCpu") is not None
+    ]
     return {
         "status": status,
         "route": route_id,
@@ -204,8 +215,10 @@ def validate_provider_route(
         "latencyMs": latency_ms,
         "outputParity": {
             "maxDeltaVsCpu": max((float(stage["outputParity"]["maxDeltaVsCpu"]) for stage in stage_reports), default=None),
+            "minCosineSimilarityVsCpu": min(cosine_values) if cosine_values else None,
             "withinTolerance": within_tolerance,
-            "tolerance": float(tolerance),
+            "linearTolerance": effective_tolerance,
+            "visualEncoderCosineThreshold": _VISUAL_ENCODER_COSINE_THRESHOLD if cosine_values else None,
         },
         "stages": stage_reports,
     }
@@ -221,9 +234,11 @@ def runtime_route(manifest: dict[str, Any], route_id: str) -> dict[str, Any]:
     raise ValueError(f"Unknown runtime route: {route_id}")
 
 
-def route_model_specs(route: dict[str, Any]) -> list[dict[str, str]]:
+def route_model_specs(route: dict[str, Any]) -> list[dict[str, Any]]:
     specs = []
     for stage, key in (
+        ("visualEncoder", "visualEncoderOnnx"),
+        ("visualEncoder", "visual_encoder_onnx_asset"),
         ("reranker", "rerankerOnnx"),
         ("reranker", "reranker_onnx_asset"),
         ("placement", "placementOnnx"),
@@ -231,6 +246,10 @@ def route_model_specs(route: dict[str, Any]) -> list[dict[str, str]]:
         value = route.get(key)
         if value:
             spec = {"stage": stage, "onnx": str(value)}
+            if stage == "visualEncoder":
+                spec["kind"] = "visual_encoder"
+                if isinstance(route.get("visualEncoderProviderOptions"), dict):
+                    spec["provider_options"] = dict(route["visualEncoderProviderOptions"])
             if spec not in specs:
                 specs.append(spec)
     return specs
@@ -335,6 +354,123 @@ def run_onnx_smoke(onnx_path: Path, rows: list[list[float]], provider: str, cpu_
             "tolerance": float(tolerance),
         },
     }
+
+
+def run_visual_encoder_smoke(onnx_path: Path, provider: str, cpu_providers: list[str], provider_options: dict[str, Any] | None = None) -> dict[str, Any]:
+    import json
+
+    import numpy as np
+    import onnxruntime as ort
+
+    session_options = ort.SessionOptions()
+    session_options.enable_profiling = True
+    session_options.profile_file_prefix = str(Path(os.environ.get("TMPDIR", "/tmp")) / "aetherflow_visual_encoder_provider_profile")
+    input_tensor = visual_encoder_smoke_tensor(onnx_path)
+
+    provider_start = perf_counter()
+    provider_route = (provider, provider_options) if provider_options else provider
+    provider_session = ort.InferenceSession(str(onnx_path), sess_options=session_options, providers=unique_provider_list([provider_route, *cpu_providers]))
+    provider_inputs = provider_session.get_inputs()
+    provider_outputs = provider_session.get_outputs()
+    if not provider_inputs or not provider_outputs:
+        raise ValueError(f"ONNX visual encoder has no usable IO contract: {onnx_path}")
+    provider_result = provider_session.run([provider_outputs[0].name], {provider_inputs[0].name: input_tensor})[0]
+    provider_latency_ms = round((perf_counter() - provider_start) * 1000.0, 6)
+    profile_path = provider_session.end_profiling()
+    provider_profile = provider_profile_summary(profile_path, provider)
+
+    cpu_start = perf_counter()
+    cpu_session = ort.InferenceSession(str(onnx_path), providers=cpu_providers)
+    cpu_inputs = cpu_session.get_inputs()
+    cpu_outputs = cpu_session.get_outputs()
+    cpu_result = cpu_session.run([cpu_outputs[0].name], {cpu_inputs[0].name: input_tensor})[0]
+    cpu_latency_ms = round((perf_counter() - cpu_start) * 1000.0, 6)
+
+    actual_providers = list(provider_session.get_providers())
+    used_provider = actual_providers[0] if actual_providers else None
+    provider_array = np.asarray(provider_result, dtype=np.float32).reshape(-1)
+    cpu_array = np.asarray(cpu_result, dtype=np.float32).reshape(-1)
+    max_delta = float(np.max(np.abs(provider_array - cpu_array)))
+    mean_delta = float(np.mean(np.abs(provider_array - cpu_array)))
+    cosine_similarity = cosine(provider_array, cpu_array)
+    provider_ratio = provider_profile["providerEventRatio"]
+    cpu_heavy = used_provider != provider or provider_ratio < _ACCELERATED_EVENT_RATIO_THRESHOLD
+    within_tolerance = cosine_similarity >= _VISUAL_ENCODER_COSINE_THRESHOLD and not cpu_heavy
+    return {
+        "onnxPath": str(onnx_path),
+        "requestedProvider": provider,
+        "actualProviders": actual_providers,
+        "usedProvider": used_provider,
+        "cpuFallback": used_provider != provider or cpu_heavy,
+        "latencyMs": provider_latency_ms,
+        "cpuLatencyMs": cpu_latency_ms,
+        "providerProfile": provider_profile,
+        "outputParity": {
+            "maxDeltaVsCpu": max_delta,
+            "meanDeltaVsCpu": mean_delta,
+            "cosineSimilarityVsCpu": cosine_similarity,
+            "cosineThreshold": _VISUAL_ENCODER_COSINE_THRESHOLD,
+            "withinTolerance": bool(within_tolerance),
+            "tolerance": _VISUAL_ENCODER_COSINE_THRESHOLD,
+        },
+    }
+
+
+def visual_encoder_smoke_tensor(onnx_path: Path):
+    import numpy as np
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    inputs = session.get_inputs()
+    if not inputs:
+        raise ValueError(f"Cannot inspect visual encoder input shape: {onnx_path}")
+    shape = list(inputs[0].shape)
+    if len(shape) != 4:
+        raise ValueError(f"Visual encoder smoke expects a 4D BCHW input, got {shape}: {onnx_path}")
+    dims = [int(value) if isinstance(value, int) and value > 0 else fallback for value, fallback in zip(shape, [1, 3, 224, 224])]
+    values = np.linspace(-1.0, 1.0, int(np.prod(dims)), dtype=np.float32)
+    return values.reshape(dims)
+
+
+def provider_profile_summary(profile_path: str, provider: str) -> dict[str, Any]:
+    import json
+
+    events = json.loads(Path(profile_path).read_text(encoding="utf-8"))
+    provider_counts: dict[str, int] = {}
+    for event in events:
+        event_provider = (event.get("args") or {}).get("provider")
+        if event_provider:
+            provider_counts[str(event_provider)] = provider_counts.get(str(event_provider), 0) + 1
+    provider_events = provider_counts.get(provider, 0)
+    cpu_events = provider_counts.get("CPUExecutionProvider", 0)
+    total_provider_events = sum(provider_counts.values())
+    provider_ratio = float(provider_events / total_provider_events) if total_provider_events else 0.0
+    return {
+        "profilePath": profile_path,
+        "providerEventCounts": provider_counts,
+        "providerEventRatio": provider_ratio,
+        "acceleratedEventRatioThreshold": _ACCELERATED_EVENT_RATIO_THRESHOLD,
+        "cpuHeavy": bool(provider != "CPUExecutionProvider" and provider_ratio < _ACCELERATED_EVENT_RATIO_THRESHOLD),
+    }
+
+
+def cosine(left: Any, right: Any) -> float:
+    import numpy as np
+
+    left_array = np.asarray(left, dtype=np.float32).reshape(-1)
+    right_array = np.asarray(right, dtype=np.float32).reshape(-1)
+    denominator = float(np.linalg.norm(left_array) * np.linalg.norm(right_array))
+    if denominator == 0.0:
+        return 1.0 if float(np.linalg.norm(left_array - right_array)) == 0.0 else 0.0
+    return float(np.dot(left_array, right_array) / denominator)
+
+
+def unique_provider_list(providers: list[Any]) -> list[Any]:
+    unique = []
+    for provider in providers:
+        if provider not in unique:
+            unique.append(provider)
+    return unique
 
 
 def validate_onnx_model(model_manifest_path: str | Path, model_manifest: dict[str, Any]) -> dict[str, Any]:
