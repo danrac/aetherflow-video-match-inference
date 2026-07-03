@@ -118,6 +118,8 @@ def timed_stage(timings: list[dict[str, float | str]], stage: str, callback):
 def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], ranked: list[dict]) -> list[dict]:
     if not ranked:
         return ranked
+    if trusted_canonical_metadata_available(request, reference_features, candidates):
+        return [ranked_candidate_with_skipped_media(item, "trusted_canonical_metadata_available") for item in ranked]
     candidate_by_group = {str(candidate.get("candidate_group_id") or candidate["candidate_id"]): candidate for candidate in candidates}
     rescored = []
     media_rescore_limit = 6
@@ -145,6 +147,20 @@ def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, 
         updated["window_candidates"] = annotate_media_window_candidates(item.get("window_candidates", []), media)
         rescored.append(updated)
     return sorted(rescored, key=lambda row: (float(row["distance"]), row["candidate_id"]))
+
+
+def trusted_canonical_metadata_available(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict]) -> bool:
+    reference_index = canonical_reference_index(request.metadata, reference_features)
+    if reference_index is None:
+        return False
+    candidate_indices = [canonical_candidate_reference_index(candidate) for candidate in candidates]
+    return any(index == reference_index for index in candidate_indices)
+
+
+def ranked_candidate_with_skipped_media(item: dict, reason: str) -> dict:
+    updated = dict(item)
+    updated["media_window"] = {"distance": None, "skipped": True, "reason": reason}
+    return updated
 
 
 def annotate_media_window_candidates(window_candidates: list[dict], media: dict) -> list[dict]:
@@ -464,6 +480,8 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
                 source_duration=max(1, source_out - source_in),
                 fps=float(reference_features.get("fps", 30.0) or 30.0),
                 model=placement_model,
+                request_metadata=request.metadata,
+                candidate_metadata=candidate.get("metadata"),
             )
         reconstruction_parameters = {
             "candidate_id": candidate["candidate_id"],
@@ -635,6 +653,7 @@ def placement_match_fields(placement: dict | None) -> dict:
         "placementDiagnostics": placement.get("placementDiagnostics"),
         "recommendedTransformCandidate": placement.get("recommendedTransformCandidate"),
         "recommendedTransformPolicy": placement.get("recommendedTransformPolicy"),
+        "acceleration": placement.get("acceleration"),
     }
 
 

@@ -517,6 +517,39 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertTrue(result["ranking"]["top_candidates"][0]["canonicalMetadataPrior"]["matched"])
             self.assertEqual(result["matches"][0]["source_in"], 5)
 
+    def test_source_window_match_preserves_fast_path_placement_on_final_match(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-fast-placement-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            placement_model = root / "placement.json"
+            write_json(placement_model, {"model_id": "test-placement", "model_version": "0.0.1", "recommended_transform_fast_path": True})
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0], source_window={"source_in": 0, "source_out": 30})
+            source_features = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 33})
+
+            result = match_source_windows(
+                SourceWindowMatchRequest(
+                    reference_path="/tmp/reference.mp4",
+                    model_manifest_path=str(model_manifest),
+                    reference_feature_manifest_path=str(reference_features),
+                    placement_model_path=str(placement_model),
+                    metadata={
+                        "canonical_reference_index": 1,
+                        "target_size": {"width": 1080, "height": 1920},
+                        "source_size": {"width": 1920, "height": 1080},
+                        "editor_transform": {"scale_factor": 1.0, "x_offset_percent": 0.0, "y_offset_percent": 0.0},
+                    },
+                    candidates=(
+                        SourceWindowCandidate("candidate-a", "edit-001", "/tmp/a.mp4", "clip-a", str(source_features), 3, 33, metadata={"source_reference_index": 1, "canonical_source_start_frame": 3}),
+                    ),
+                )
+            )
+
+            self.assertEqual(result["ranking"]["top_candidates"][0]["media_window"]["reason"], "trusted_canonical_metadata_available")
+            self.assertEqual(result["matches"][0]["placementCandidatePolicy"], "model_recommended_transform_fast_path")
+            self.assertEqual(result["matches"][0]["placementRankingMode"], "recommended_transform_fast_path_v1")
+            self.assertTrue(result["matches"][0]["placementDiagnostics"]["cpuOpenCvRegistrationSkipped"])
+            self.assertEqual(result["matches"][0]["acceleration"]["mode"], "model_recommended_transform_fast_path")
+
     def test_source_window_match_attaches_placement_to_ranked_candidates(self) -> None:
         with tempfile.TemporaryDirectory(prefix="aetherflow-inference-ranked-placement-") as temp_dir:
             root = Path(temp_dir)
