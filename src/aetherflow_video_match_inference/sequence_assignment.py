@@ -19,8 +19,8 @@ def assign_ranked_reference_sequence(rows: list[dict[str, Any]], *, top_n: int =
             continue
         next_beams = []
         for beam in beams:
-            for candidate in candidates:
-                pair = candidate_pair(row, candidate)
+            for rank_index, candidate in enumerate(candidates):
+                pair = candidate_pair(row, candidate, rank_index)
                 window = candidate_window(pair)
                 transition = transition_score(beam["windows"], window)
                 next_beams.append(
@@ -49,13 +49,16 @@ def assign_ranked_reference_sequence(rows: list[dict[str, Any]], *, top_n: int =
     }
 
 
-def candidate_pair(row: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+def candidate_pair(row: dict[str, Any], candidate: dict[str, Any], rank_index: int = 0) -> dict[str, Any]:
+    confidence = float(candidate.get("finalScore", 0.0) or 0.0)
     return {
         "referenceSegmentId": row["referenceSegmentId"],
         "candidateSourceSegmentId": str(candidate["candidateSourceSegmentId"]),
         "candidateSourceStartFrame": int(candidate["candidateSourceStartFrame"]),
         "candidateSourceEndFrame": int(candidate["candidateSourceEndFrame"]),
-        "score": float(candidate["finalScore"]),
+        "score": round((0.001 * confidence) - (0.05 * float(rank_index)), 6),
+        "rankIndex": int(rank_index),
+        "finalScore": confidence,
     }
 
 
@@ -73,12 +76,18 @@ def transition_score(previous_windows: list[tuple[str, int, int]], current_windo
     if previous_windows:
         previous_segment, previous_start, _previous_end = previous_windows[-1]
         if current_segment == previous_segment:
-            score -= 0.015
+            score -= 0.005
+    if any(previous_segment == current_segment for previous_segment, _previous_start, _previous_end in previous_windows[:-1]):
+        score -= 0.8
     for previous_segment, previous_start, previous_end in previous_windows:
         overlap = max(0, min(previous_end, current_end) - max(previous_start, current_start))
         if overlap <= 0:
             continue
-        score -= min(0.6, overlap / 100.0)
         if previous_segment == current_segment:
-            score -= 0.2
+            if previous_windows and previous_segment == previous_windows[-1][0]:
+                score -= min(0.08, overlap / 500.0)
+            else:
+                score -= 0.3
+        else:
+            score -= min(0.6, overlap / 100.0)
     return score

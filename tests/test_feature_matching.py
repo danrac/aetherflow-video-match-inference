@@ -15,6 +15,7 @@ from aetherflow_video_match_inference.cli import load_source_window_match_reques
 from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, match, match_source_windows
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
+from aetherflow_video_match_inference.media_window import sample_relative_frames, score_candidate_start
 from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
 from aetherflow_video_match_inference.placement import pair_features, placement_candidates_for_match, placement_diagnostics, placement_ranking_score, placement_sample_offsets, recommended_transform_candidate
 from aetherflow_video_match_inference.reranker import fragment_tolerant_color_distance
@@ -243,6 +244,26 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertEqual(selected[1]["candidateSourceSegmentId"], "source-b")
         self.assertEqual(selected[2]["candidateSourceSegmentId"], "source-c")
 
+    def test_sequence_assignment_penalizes_non_adjacent_source_reuse(self) -> None:
+        rows = [
+            sequence_row("reference-a", [sequence_candidate("source-a", 100, 160, 0.91)]),
+            sequence_row("reference-b", [sequence_candidate("source-a", 162, 220, 0.90)]),
+            sequence_row(
+                "reference-c",
+                [
+                    sequence_candidate("source-a", 500, 560, 0.92),
+                    sequence_candidate("source-b", 700, 760, 0.89),
+                ],
+            ),
+        ]
+
+        assignment = assign_ranked_reference_sequence(rows, top_n=2)
+
+        selected = assignment["selectedPairs"]
+        self.assertEqual(selected[0]["candidateSourceSegmentId"], "source-a")
+        self.assertEqual(selected[1]["candidateSourceSegmentId"], "source-a")
+        self.assertEqual(selected[2]["candidateSourceSegmentId"], "source-b")
+
     def test_fragment_tolerant_distance_scores_embedded_live_window(self) -> None:
         reference = feature_doc_from_colors([[10.0, 20.0, 30.0], [20.0, 30.0, 40.0]])
         noisy_source = feature_doc_from_colors(
@@ -258,6 +279,46 @@ class FeatureMatchingTests(unittest.TestCase):
 
         self.assertLess(distance, 1.0)
         self.assertLess(distance, visual_distance(reference, noisy_source) * 0.01)
+
+    def test_media_window_score_can_prefer_reverse_temporal_samples(self) -> None:
+        rel_frames = sample_relative_frames(21)
+        reference_values = {4: 10.0, 10: 20.0, 16: 30.0}
+        source_values = {4: 30.0, 10: 20.0, 16: 10.0}
+
+        def fake_read_frame(path: str, frame_index: int, fps: float) -> float:
+            return source_values[frame_index] if path == "source.mp4" else reference_values[frame_index]
+
+        def fake_crop_distance(reference_array: float, source_frame: float, np, image_ops) -> float:
+            return abs(reference_array - source_frame)
+
+        with patch("aetherflow_video_match_inference.media_window.read_video_frame", side_effect=fake_read_frame):
+            with patch("aetherflow_video_match_inference.media_window.best_crop_distance", side_effect=fake_crop_distance):
+                forward = score_candidate_start(
+                    "source.mp4",
+                    0,
+                    rel_frames,
+                    30.0,
+                    [reference_values[frame] for frame in rel_frames],
+                    None,
+                    None,
+                    reference_duration=21,
+                    playback_direction="forward",
+                )
+                reverse = score_candidate_start(
+                    "source.mp4",
+                    0,
+                    rel_frames,
+                    30.0,
+                    [reference_values[frame] for frame in rel_frames],
+                    None,
+                    None,
+                    reference_duration=21,
+                    playback_direction="reverse",
+                )
+
+        self.assertEqual(rel_frames, [4, 10, 16])
+        self.assertGreater(forward, reverse)
+        self.assertEqual(reverse, 0.0)
 
     def test_v3_feature_distance_uses_scene_and_flow_stats(self) -> None:
         reference = {

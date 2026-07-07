@@ -2,15 +2,18 @@
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 from time import perf_counter
 
 from .features import color_distance, confidence_from_distance, load_feature_manifest
-from .media_window import media_window_rescore, refine_boundary_start
+from .media_window import candidate_search_max_start, candidate_start_grid, media_window_rescore, read_video_frame, refine_boundary_start, sample_relative_frames, source_crop_images
 from .placement import load_placement_model, placement_candidates_for_match, placement_model_summary
 from .reranker import load_reranker_model, rank_candidates, reranker_model_summary
+from .visual_encoder import VisualEncoderScorer
 
 DEFAULT_RANKED_PLACEMENT_LIMIT = 10
+_VISUAL_ENCODER_SCORERS: dict[str, VisualEncoderScorer] = {}
 
 
 @dataclass(frozen=True)
@@ -45,6 +48,7 @@ class SourceWindowMatchRequest:
     transforms: tuple[dict, ...] = ()
     reranker_model_path: str | None = None
     placement_model_path: str | None = None
+    visual_encoder_onnx_path: str | None = None
     metadata: dict | None = None
 
 
@@ -68,6 +72,7 @@ def describe_source_window_request(request: SourceWindowMatchRequest) -> dict[st
         "transform_types": sorted({str(transform.get("type")) for transform in request.transforms if transform.get("type")}),
         "reranker_model_path": request.reranker_model_path,
         "placement_model_path": request.placement_model_path,
+        "visual_encoder_onnx_path": request.visual_encoder_onnx_path,
         "metadata_keys": sorted(request.metadata.keys()) if isinstance(request.metadata, dict) else [],
     }
 
@@ -88,10 +93,11 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
     model_manifest = load_model_manifest(request.model_manifest_path)
     reference_features = timed_stage(timings, "feature_loading.reference", lambda: load_feature_manifest(request.reference_feature_manifest_path))
     reranker_model = timed_stage(timings, "model_loading.reranker", lambda: load_reranker_model(request.reranker_model_path) if request.reranker_model_path else None)
-    placement_model = timed_stage(timings, "model_loading.placement", lambda: load_placement_model(request.placement_model_path) if request.placement_model_path else None)
+    placement_model = timed_stage(timings, "model_loading.placement", lambda: None if source_window_skip_placement_enabled() else (load_placement_model(request.placement_model_path) if request.placement_model_path else None))
     candidates = timed_stage(timings, "feature_loading.candidates", lambda: [source_window_candidate_to_scoring_input(candidate) for candidate in request.candidates])
     ranked = timed_stage(timings, "source_window_scoring", lambda: rank_candidates(reference_features, candidates, list(request.transforms), reranker_model))
     ranked = timed_stage(timings, "media_window_rescore", lambda: rescore_ranked_source_windows_with_media(request, reference_features, candidates, ranked))
+    ranked = timed_stage(timings, "visual_encoder_rescore", lambda: rescore_ranked_source_windows_with_visual_encoder(request, reference_features, ranked))
     ranked = timed_stage(timings, "canonical_metadata_prior", lambda: apply_canonical_metadata_prior(request, reference_features, candidates, ranked))
     ranked = timed_stage(timings, "placement_candidate_generation", lambda: attach_placement_to_ranked_candidates(request, reference_features, candidates, ranked, placement_model))
     if not ranked:
@@ -115,6 +121,10 @@ def timed_stage(timings: list[dict[str, float | str]], stage: str, callback):
     return result
 
 
+def source_window_skip_placement_enabled() -> bool:
+    return str(os.environ.get("AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT", "")).lower() in {"1", "true", "yes", "on"}
+
+
 def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], ranked: list[dict]) -> list[dict]:
     if not ranked:
         return ranked
@@ -122,7 +132,7 @@ def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, 
         return [ranked_candidate_with_skipped_media(item, "trusted_canonical_metadata_available") for item in ranked]
     candidate_by_group = {str(candidate.get("candidate_group_id") or candidate["candidate_id"]): candidate for candidate in candidates}
     rescored = []
-    media_rescore_limit = 6
+    media_rescore_limit = media_window_rescore_limit()
     for rank_index, item in enumerate(ranked):
         candidate = candidate_by_group.get(str(item.get("candidate_id", "")))
         if candidate is None or rank_index >= media_rescore_limit:
@@ -142,11 +152,230 @@ def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, 
         feature_distance = float(item.get("distance", float("inf")))
         updated["feature_distance"] = round(feature_distance, 6) if feature_distance != float("inf") else float("inf")
         updated["media_window"] = media
-        updated["distance"] = round((feature_distance * 0.10) + (media_distance * 0.90), 6)
+        updated["distance"] = round((feature_distance * 0.50) + (media_distance * 0.50), 6)
         updated["raw_distance"] = updated["distance"]
         updated["window_candidates"] = annotate_media_window_candidates(item.get("window_candidates", []), media)
         rescored.append(updated)
     return sorted(rescored, key=lambda row: (float(row["distance"]), row["candidate_id"]))
+
+
+def media_window_rescore_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("AETHERFLOW_VIDEO_MATCH_MEDIA_RESCORE_LIMIT", "6")))
+    except ValueError:
+        return 6
+
+
+def rescore_ranked_source_windows_with_visual_encoder(request: SourceWindowMatchRequest, reference_features: dict, ranked: list[dict]) -> list[dict]:
+    if not request.visual_encoder_onnx_path or not ranked:
+        return ranked
+    try:
+        scorer = visual_encoder_scorer_for_path(request.visual_encoder_onnx_path)
+    except Exception:
+        return [ranked_candidate_with_visual_encoder_skip(item, "visual_encoder_unavailable") for item in ranked]
+    reference_window = reference_features.get("source_window") if isinstance(reference_features.get("source_window"), dict) else {}
+    reference_start = int(reference_window.get("source_in", 0) or 0)
+    reference_duration = reference_window_duration(reference_features)
+    reference_fps = float(reference_features.get("fps", 30.0) or 30.0)
+    rel_frames = sample_relative_frames(reference_duration)
+    reference_embeddings = []
+    try:
+        for rel_frame in rel_frames:
+            reference_frame = read_video_frame(request.reference_path, reference_start + rel_frame, reference_fps)
+            if reference_frame is None:
+                return [ranked_candidate_with_visual_encoder_skip(item, "reference_frame_unavailable") for item in ranked]
+            reference_embeddings.append((rel_frame, scorer.encode(reference_frame.convert("RGB"))))
+    except Exception:
+        return [ranked_candidate_with_visual_encoder_skip(item, "reference_embedding_failed") for item in ranked]
+
+    rescored = []
+    visual_limit = visual_encoder_candidate_limit()
+    for rank_index, item in enumerate(ranked):
+        updated = dict(item)
+        if rank_index >= visual_limit:
+            updated["visual_encoder_window"] = {"skipped": True, "reason": "outside_visual_encoder_top_n"}
+            rescored.append(updated)
+            continue
+        source_path = ranked_item_source_path(item)
+        if not source_path:
+            updated["visual_encoder_window"] = {"skipped": True, "reason": "source_path_unavailable"}
+            rescored.append(updated)
+            continue
+        visual_match = best_visual_source_window(request, item, reference_features, reference_embeddings, scorer)
+        if visual_match is None:
+            updated["visual_encoder_window"] = {"skipped": True, "reason": "source_embedding_failed"}
+            rescored.append(updated)
+            continue
+        visual_distance = float(visual_match["distance"])
+        feature_distance = float(updated.get("feature_distance", updated.get("raw_distance", updated.get("distance", 0.0))) or 0.0)
+        media_distance = None
+        media_window = item.get("media_window") if isinstance(item.get("media_window"), dict) else {}
+        if isinstance(media_window, dict) and media_window.get("distance") is not None:
+            media_distance = float(media_window["distance"])
+        feature_weight, media_weight, visual_weight = visual_encoder_blend_weights()
+        blended = (feature_distance * feature_weight) + ((media_distance if media_distance is not None else feature_distance) * media_weight) + (float(visual_distance) * visual_weight)
+        updated["distance"] = round(blended, 6)
+        updated["raw_distance"] = updated["distance"]
+        updated["visual_encoder_window"] = {
+            "distance": round(float(visual_distance), 6),
+            "sourceFrame": int(visual_match["source_frame"]),
+            "source_in": int(visual_match["source_in"]),
+            "source_out": int(visual_match["source_out"]),
+            "playback_direction": visual_match["playback_direction"],
+            "temporal_sample_count": int(visual_match.get("temporal_sample_count", 1)),
+            "candidateFramePolicy": "visual_grid_best_start",
+        }
+        updated["window_candidates"] = annotate_visual_window_candidates(updated.get("window_candidates", []), visual_match)
+        rescored.append(updated)
+    return sorted(rescored, key=lambda row: (float(row["distance"]), row["candidate_id"]))
+
+
+def visual_encoder_scorer_for_path(onnx_path: str) -> VisualEncoderScorer:
+    scorer = _VISUAL_ENCODER_SCORERS.get(onnx_path)
+    if scorer is None:
+        scorer = VisualEncoderScorer(onnx_path)
+        _VISUAL_ENCODER_SCORERS[onnx_path] = scorer
+    return scorer
+
+
+def best_visual_source_window(request: SourceWindowMatchRequest, item: dict, reference_features: dict, reference_embeddings: list[tuple[int, tuple[float, ...]]], scorer: VisualEncoderScorer) -> dict | None:
+    window = item.get("window_candidates", [{}])[0] if item.get("window_candidates") else {}
+    source_path = window.get("source_path") or item.get("source_path")
+    if not source_path:
+        return None
+    reference_duration = reference_window_duration(reference_features)
+    reference_fps = float(reference_features.get("fps", 30.0) or 30.0)
+    source_in = int(window.get("candidate_source_in", window.get("source_in", 0)) or 0)
+    source_out = int(window.get("candidate_source_out", window.get("source_out", source_in + reference_duration)) or source_in + reference_duration)
+    source_out = max(source_out, source_in + 1)
+    max_start = candidate_search_max_start(source_in, source_out, reference_duration)
+    rel_frames = sample_relative_frames(reference_duration)
+    feature_document = {"features": []}
+    starts = candidate_start_grid(source_in, max_start, rel_frames, feature_document)
+    starts.extend(visual_boundary_starts(source_in, source_out, reference_duration))
+    best = None
+    alternatives = []
+    for start in sorted(set(starts)):
+        if start < source_in or start > max_start:
+            continue
+        for playback_direction in ("forward", "reverse"):
+            try:
+                sample_distances = []
+                source_frame_index = start
+                for rel_frame, reference_embedding in reference_embeddings:
+                    source_rel_frame = rel_frame
+                    if playback_direction == "reverse":
+                        source_rel_frame = max(0, reference_duration - 1 - rel_frame)
+                    source_frame_index = start + source_rel_frame
+                    source_frame = read_video_frame(str(source_path), source_frame_index, reference_fps)
+                    if source_frame is None:
+                        sample_distances = []
+                        break
+                    sample_distances.append(min(scorer.cosine_distance(reference_embedding, crop) for crop in source_crop_images(source_frame)))
+                if not sample_distances:
+                    continue
+                distance = sum(sample_distances) / len(sample_distances)
+            except Exception:
+                continue
+            row = {
+                "distance": float(distance),
+                "source_frame": source_frame_index,
+                "source_in": start,
+                "source_out": start + reference_duration,
+                "playback_direction": playback_direction,
+                "temporal_sample_count": len(sample_distances),
+            }
+            alternatives.append(row)
+            if best is None or row["distance"] < float(best["distance"]):
+                best = row
+    if best is not None:
+        best["alternatives"] = sorted(alternatives, key=lambda row: (float(row["distance"]), int(row["source_in"])))[:8]
+        boundary_start = candidate_search_max_start(source_in, source_out, reference_duration)
+        if abs(int(best["source_in"]) - boundary_start) <= 6:
+            boundary = next((row for row in alternatives if int(row["source_in"]) == boundary_start), None)
+            if boundary is not None:
+                boundary["alternatives"] = best["alternatives"]
+                boundary["boundary_snap"] = True
+                best = boundary
+    return best
+
+
+def visual_boundary_starts(source_in: int, source_out: int, reference_duration: int) -> list[int]:
+    max_start = candidate_search_max_start(source_in, source_out, reference_duration)
+    slack_start = max(source_in, source_out - max(1, reference_duration))
+    return [
+        source_in,
+        max_start,
+        slack_start,
+        max(source_in, source_out - max(1, round(reference_duration * 0.5))),
+        max(source_in, source_out - max(1, round(reference_duration * 0.8))),
+    ]
+
+
+def annotate_visual_window_candidates(window_candidates: list[dict], visual_match: dict) -> list[dict]:
+    if not window_candidates:
+        return window_candidates
+    annotated = []
+    primary_candidate_id = str(window_candidates[0].get("candidate_id", "")) if window_candidates else ""
+    for index, candidate in enumerate(window_candidates):
+        updated = dict(candidate)
+        if index == 0:
+            updated["visual_encoder_distance"] = round(float(visual_match["distance"]), 6)
+            updated["source_in"] = int(visual_match["source_in"])
+            updated["source_out"] = int(visual_match["source_out"])
+            updated["playback_direction"] = visual_match["playback_direction"]
+        annotated.append(updated)
+    seen = {(str(item.get("candidate_id", "")), int(item.get("source_in", 0)), int(item.get("source_out", 0))) for item in annotated}
+    for alternative in visual_match.get("alternatives", []):
+        source_in = int(alternative["source_in"])
+        source_out = int(alternative["source_out"])
+        key = (primary_candidate_id, source_in, source_out)
+        if key in seen:
+            continue
+        seen.add(key)
+        base = dict(window_candidates[0])
+        base["candidate_id"] = primary_candidate_id
+        base["source_in"] = source_in
+        base["source_out"] = source_out
+        base["visual_encoder_distance"] = round(float(alternative["distance"]), 6)
+        base["distance"] = round(float(alternative["distance"]) * 90.0, 6)
+        base["playback_direction"] = alternative["playback_direction"]
+        base["windowCandidatePolicy"] = "visual_grid_alternative"
+        annotated.append(base)
+    return annotated
+
+
+def visual_encoder_candidate_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("AETHERFLOW_VIDEO_MATCH_VISUAL_RERANK_LIMIT", "8")))
+    except ValueError:
+        return 8
+
+
+def visual_encoder_blend_weights() -> tuple[float, float, float]:
+    def value(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, str(default)))
+        except ValueError:
+            return default
+
+    return (
+        value("AETHERFLOW_VIDEO_MATCH_VISUAL_FEATURE_WEIGHT", 0.05),
+        value("AETHERFLOW_VIDEO_MATCH_VISUAL_MEDIA_WEIGHT", 0.10),
+        value("AETHERFLOW_VIDEO_MATCH_VISUAL_WEIGHT", 15.0),
+    )
+
+
+def ranked_candidate_with_visual_encoder_skip(item: dict, reason: str) -> dict:
+    updated = dict(item)
+    updated["visual_encoder_window"] = {"skipped": True, "reason": reason}
+    return updated
+
+
+def ranked_item_source_path(item: dict) -> str | None:
+    window = item.get("window_candidates", [{}])[0] if item.get("window_candidates") else {}
+    source_path = window.get("source_path") or item.get("source_path")
+    return str(source_path) if source_path else None
 
 
 def trusted_canonical_metadata_available(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict]) -> bool:
@@ -171,6 +400,8 @@ def annotate_media_window_candidates(window_candidates: list[dict], media: dict)
         updated = dict(candidate)
         if index == 0:
             updated["media_distance"] = media.get("distance")
+            updated.setdefault("candidate_source_in", int(updated.get("source_in", 0)))
+            updated.setdefault("candidate_source_out", int(updated.get("source_out", updated.get("source_in", 0) + 1)))
             updated["source_in"] = int(media.get("source_in", updated.get("source_in", 0)))
             updated["source_out"] = int(media.get("source_out", updated.get("source_out", updated.get("source_in", 0) + 1)))
         annotated.append(updated)
@@ -566,32 +797,37 @@ def source_window_diagnostics(request: SourceWindowMatchRequest, reference_featu
     candidate_rows = []
     for item in ranked:
         candidate_id = str(item.get("candidate_id", ""))
-        window = item.get("window_candidates", [{}])[0] if item.get("window_candidates") else {}
-        source_start = int(window.get("source_in", item.get("source_in", 0)) or 0)
-        source_end = int(window.get("source_out", item.get("source_out", source_start + 1)) or source_start + 1)
-        selected_match = selected_match_by_candidate_id.get(candidate_id)
-        if selected_match is not None:
-            source_start = int(selected_match.get("source_in", source_start))
-            source_end = int(selected_match.get("source_out", source_end))
         raw_distance = float(item.get("raw_distance", item.get("distance", float("inf"))))
         final_distance = float(item.get("distance", float("inf")))
-        candidate_rows.append(
-            {
-                "referenceSegmentId": reference_segment_id,
-                "candidateSourceSegmentId": candidate_source_segment_id(candidate_id),
-                "candidateSourceStartFrame": source_start,
-                "candidateSourceEndFrame": source_end,
-                "referenceStartFrame": reference_start,
-                "referenceEndFrame": reference_end,
-                "visualScore": confidence_from_distance(raw_distance if raw_distance != float("inf") else None),
-                "temporalOrderScore": None,
-                "modelScore": confidence_from_distance(final_distance if final_distance != float("inf") else None),
-                "finalScore": confidence_from_distance(final_distance if final_distance != float("inf") else None),
-                "selected": candidate_id == selected_id,
-                "rejectionReason": "" if candidate_id == selected_id else "lower_ranked_candidate",
-                **ranked_candidate_placement_fields(item, selected_match),
-            }
-        )
+        selected_match = selected_match_by_candidate_id.get(candidate_id)
+        windows = item.get("window_candidates", [{}]) if item.get("window_candidates") else [{}]
+        for window_index, window in enumerate(windows[:6]):
+            source_start = int(window.get("source_in", item.get("source_in", 0)) or 0)
+            source_end = int(window.get("source_out", item.get("source_out", source_start + 1)) or source_start + 1)
+            if selected_match is not None and window_index == 0:
+                source_start = int(selected_match.get("source_in", source_start))
+                source_end = int(selected_match.get("source_out", source_end))
+            window_distance = float(window.get("distance", final_distance) if window.get("distance", final_distance) != float("inf") else final_distance)
+            row_score = confidence_from_distance(window_distance if window_distance != float("inf") else None)
+            candidate_rows.append(
+                {
+                    "referenceSegmentId": reference_segment_id,
+                    "candidateSourceSegmentId": candidate_source_segment_id(candidate_id),
+                    "candidateSourceStartFrame": source_start,
+                    "candidateSourceEndFrame": source_end,
+                    "referenceStartFrame": reference_start,
+                    "referenceEndFrame": reference_end,
+                    "visualScore": confidence_from_distance(raw_distance if raw_distance != float("inf") else None),
+                    "temporalOrderScore": None,
+                    "modelScore": confidence_from_distance(final_distance if final_distance != float("inf") else None),
+                    "finalScore": row_score,
+                    "selected": candidate_id == selected_id and window_index == 0,
+                    "rejectionReason": "" if candidate_id == selected_id and window_index == 0 else "lower_ranked_candidate",
+                    "windowCandidateIndex": window_index,
+                    "windowCandidatePolicy": window.get("windowCandidatePolicy"),
+                    **ranked_candidate_placement_fields(item, selected_match if window_index == 0 else None),
+                }
+            )
     return {
         "rankedCandidates": candidate_rows,
         "globalAssignment": {

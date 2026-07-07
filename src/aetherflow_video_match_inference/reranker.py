@@ -108,6 +108,7 @@ def prepare_candidate_groups(candidates: list[dict]) -> list[dict]:
 def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: list[dict], reference_transforms: list[dict], reranker_model: dict | None = None) -> list[dict]:
     reference_transform_types = transform_types_from_transforms(reference_transforms)
     is_reverse_reference = "reverse" in reference_transform_types
+    is_global_reverse_reference = is_reverse_reference and len(reference_transform_types) == 1
     ranked = []
     for group in prepared_groups:
         group_id = str(group["group_id"])
@@ -116,25 +117,26 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
         combined_features = group["combined_features"]
         parallel_documents = group["parallel_documents"]
         parallel_features = group["parallel_features"]
-        scoring_ordered_features = reverse_feature_documents_for_playback(ordered_features) if is_reverse_reference else ordered_features
-        scoring_combined_features = reverse_feature_document(combined_features) if is_reverse_reference and combined_features is not None else combined_features
-        scoring_parallel_documents = [reverse_feature_document(document) for document in parallel_documents] if is_reverse_reference else parallel_documents
-        scoring_parallel_features = reverse_feature_document(parallel_features) if is_reverse_reference and parallel_features is not None else parallel_features
+        scoring_ordered_features = reverse_feature_documents_for_playback(ordered_features) if is_global_reverse_reference else ordered_features
+        scoring_combined_features = reverse_feature_document(combined_features) if is_global_reverse_reference and combined_features is not None else combined_features
+        scoring_parallel_documents = [reverse_feature_document(document) for document in parallel_documents] if is_global_reverse_reference else parallel_documents
+        scoring_parallel_features = reverse_feature_document(parallel_features) if is_global_reverse_reference and parallel_features is not None else parallel_features
         scored_windows = []
         for candidate in group_candidates:
-            scoring_features = reverse_feature_document(candidate["features"]) if is_reverse_reference else candidate["features"]
-            distance = fragment_tolerant_color_distance(reference_features, scoring_features, allow_temporal_reverse=not is_reverse_reference)
+            scoring_features = reverse_feature_document(candidate["features"]) if is_global_reverse_reference else candidate["features"]
+            distance = fragment_tolerant_color_distance(reference_features, scoring_features, allow_temporal_reverse=not is_global_reverse_reference)
             scored_windows.append(
                 {
                     "candidate_id": candidate["candidate_id"],
                     "clip_id": candidate["clip_id"],
+                    "source_path": candidate.get("source_path"),
                     "source_in": int(candidate["source_window_entry"].get("source_in", 0)),
                     "source_out": int(candidate["source_window_entry"].get("source_out", 0)),
                     "distance": distance if distance is not None else float("inf"),
                 }
             )
-        combined_distance = fragment_tolerant_color_distance(reference_features, scoring_combined_features, allow_temporal_reverse=not is_reverse_reference) if scoring_combined_features is not None else None
-        parallel_distance = fragment_tolerant_color_distance(reference_features, scoring_parallel_features, allow_temporal_reverse=not is_reverse_reference) if scoring_parallel_features is not None else None
+        combined_distance = fragment_tolerant_color_distance(reference_features, scoring_combined_features, allow_temporal_reverse=not is_global_reverse_reference) if scoring_combined_features is not None else None
+        parallel_distance = fragment_tolerant_color_distance(reference_features, scoring_parallel_features, allow_temporal_reverse=not is_global_reverse_reference) if scoring_parallel_features is not None else None
         panel_layout_distance = (
             parallel_panel_layout_distance(reference_features, scoring_parallel_documents)
             if "split_screen" in reference_transform_types and scoring_parallel_documents
@@ -144,6 +146,8 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
         segment_sequence_distance = (
             simple_cut_segment_sequence_distance(reference_features, scoring_ordered_features)
             if "simple_cut" in reference_transform_types and is_segment_sequence_group(scoring_ordered_features)
+            else transformed_segment_sequence_distance(reference_features, ordered_features, reference_transforms)
+            if is_mixed_temporal_segment_sequence(reference_transform_types, ordered_features, reference_transforms)
             else None
         )
         pip_overlay_distance = (
@@ -154,7 +158,7 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
         spatial_distance = spatial_transform_distance(reference_features, scoring_combined_features, reference_transforms) if scoring_combined_features is not None else None
         finite_distances = [float(item["distance"]) for item in scored_windows if item["distance"] != float("inf")]
         average_window_distance = sum(finite_distances) / len(finite_distances) if finite_distances else None
-        tail_distance = tail_visual_distance(reference_features, scoring_combined_features, start_fraction=0.7, allow_temporal_reverse=not is_reverse_reference) if scoring_combined_features is not None else None
+        tail_distance = tail_visual_distance(reference_features, scoring_combined_features, start_fraction=0.7, allow_temporal_reverse=not is_global_reverse_reference) if scoring_combined_features is not None else None
         components = {
             "combined_visual": combined_distance,
             "average_window": average_window_distance,
@@ -164,7 +168,7 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
             "segment_sequence": segment_sequence_distance,
             "spatial_transform": spatial_distance,
             "pip_overlay": pip_overlay_distance,
-            "family_penalty": candidate_family_penalty(ordered_features, reference_transform_types) + split_panel_count_penalty,
+            "family_penalty": candidate_family_penalty(ordered_features, reference_transform_types, reference_transforms) + split_panel_count_penalty,
             "window_count": float(len(scored_windows)),
         }
         group_distance = best_group_distance(combined_distance, average_window_distance, tail_distance, parallel_distance, panel_layout_distance, segment_sequence_distance, spatial_distance, pip_overlay_distance)
@@ -358,8 +362,33 @@ def is_segment_sequence_group(feature_documents: list[dict]) -> bool:
     return len(roles) >= 2 and all(role == "segment" for role in roles)
 
 
-def candidate_family_penalty(feature_documents: list[dict], reference_transform_types: set[str]) -> float:
+def is_mixed_temporal_segment_sequence(
+    transform_types: set[str],
+    feature_documents: list[dict],
+    transforms: list[dict],
+) -> bool:
+    if not is_segment_sequence_group(feature_documents):
+        return False
+    if len(feature_documents) != len(transforms):
+        return False
+    temporal_types = {"freeze_frame", "identity", "reverse"}
+    return "reverse" in transform_types and "freeze_frame" in transform_types and transform_types.issubset(temporal_types)
+
+
+def is_mixed_temporal_reference(transform_types: set[str], transforms: list[dict]) -> bool:
+    temporal_types = {"freeze_frame", "identity", "reverse"}
+    return (
+        len(transforms) >= 2
+        and "reverse" in transform_types
+        and "freeze_frame" in transform_types
+        and transform_types.issubset(temporal_types)
+    )
+
+
+def candidate_family_penalty(feature_documents: list[dict], reference_transform_types: set[str], reference_transforms: list[dict] | None = None) -> float:
     if "simple_cut" in reference_transform_types and not is_segment_sequence_group(feature_documents):
+        return 1000.0
+    if is_mixed_temporal_reference(reference_transform_types, reference_transforms or []) and not is_mixed_temporal_segment_sequence(reference_transform_types, feature_documents, reference_transforms or []):
         return 1000.0
     if "split_screen" in reference_transform_types and not parallel_contributor_documents(feature_documents):
         return 1000.0
@@ -410,6 +439,66 @@ def simple_cut_segment_sequence_distance(reference_features: dict, feature_docum
     if not distances:
         return None
     return average(distances)
+
+
+def transformed_segment_sequence_distance(reference_features: dict, feature_documents: list[dict], transforms: list[dict]) -> float | None:
+    reference_frames = [frame for frame in reference_features.get("features", []) if isinstance(frame, dict)]
+    if not reference_frames or len(feature_documents) != len(transforms):
+        return None
+    weights = [reference_frame_weight(document, transform) for document, transform in zip(feature_documents, transforms, strict=False)]
+    reference_chunks = split_feature_frames_by_weights(reference_frames, weights)
+    distances = []
+    for chunk_frames, document, transform in zip(reference_chunks, feature_documents, transforms, strict=False):
+        if not chunk_frames:
+            continue
+        transformed_document = transform_feature_document_for_playback(document, transform)
+        if transformed_document is None:
+            continue
+        reference_document = {"features": chunk_frames, "motion_track_summary": motion_track_summary_from_frames(chunk_frames), "temporal_signature": binned_temporal_signature(chunk_frames, bins=8)}
+        distance = fragment_tolerant_color_distance(reference_document, transformed_document, allow_temporal_reverse=False)
+        if distance is not None:
+            distances.append(distance)
+    if not distances:
+        return None
+    return average(distances)
+
+
+def reference_frame_weight(feature_document: dict, transform: dict) -> int:
+    parameters = transform.get("parameters") if isinstance(transform.get("parameters"), dict) else {}
+    transform_type = str(transform.get("type", ""))
+    if transform_type == "freeze_frame":
+        return positive_int(parameters.get("hold_frames")) or 1
+    if transform_type in {"reverse", "speed_change", "cross_dissolve"}:
+        return positive_int(parameters.get("reference_frames")) or source_window_frame_count(feature_document)
+    return source_window_frame_count(feature_document)
+
+
+def source_window_frame_count(feature_document: dict) -> int:
+    entry = feature_document.get("source_window_entry") if isinstance(feature_document.get("source_window_entry"), dict) else {}
+    try:
+        return max(1, int(entry.get("source_out")) - int(entry.get("source_in")))
+    except (TypeError, ValueError):
+        return max(1, len([frame for frame in feature_document.get("features", []) if isinstance(frame, dict)]))
+
+
+def positive_int(value) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def transform_feature_document_for_playback(feature_document: dict, transform: dict) -> dict | None:
+    transform_type = str(transform.get("type", ""))
+    if transform_type == "reverse":
+        return reverse_feature_document(feature_document)
+    frames = [frame for frame in feature_document.get("features", []) if isinstance(frame, dict)]
+    if not frames:
+        return None
+    if transform_type == "freeze_frame":
+        frames = [frames[0]]
+    return {"features": frames, "motion_track_summary": motion_track_summary_from_frames(frames), "temporal_signature": binned_temporal_signature(frames, bins=8)}
 
 
 def split_feature_frames_by_weights(frames: list[dict], weights: list[int]) -> list[list[dict]]:

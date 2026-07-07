@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from .adapters import to_host_payload
@@ -35,6 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
     source_windows_batch.add_argument("--request-dir")
     source_windows_batch.add_argument("--output", required=True)
     source_windows_batch.add_argument("--schema")
+    source_windows_batch.add_argument("--skip-placement", action="store_true")
+    source_windows_batch.add_argument("--assignment-top-n", type=int, default=12)
+
+    visual_cache = subcommands.add_parser("precompute-visual-cache")
+    visual_cache.add_argument("--request", action="append", default=[])
+    visual_cache.add_argument("--request-dir")
+    visual_cache.add_argument("--schema")
+    visual_cache.add_argument("--output", required=True)
+    visual_cache.add_argument("--limit", type=int, default=16)
 
     validate_source_window = subcommands.add_parser("validate-source-window-request")
     validate_source_window.add_argument("--request", required=True)
@@ -122,37 +132,70 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "match-source-windows-batch":
         from .engine import match_source_windows
+        from .sequence_assignment import assign_ranked_reference_sequence
 
         request_paths = source_window_batch_request_paths(args.request, args.request_dir)
         results = []
         total_latency = 0.0
-        for request_path in request_paths:
-            request = load_source_window_match_request(request_path, schema_path=args.schema)
-            result = match_source_windows(request)
-            total_latency += float(result.get("performance", {}).get("totalLatencyMs", 0.0) or 0.0)
-            results.append({"request_path": str(request_path), "result": result})
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(
+        previous_skip_placement = os.environ.get("AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT")
+        if args.skip_placement:
+            os.environ["AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT"] = "1"
+        try:
+            for request_path in request_paths:
+                request = load_source_window_match_request(request_path, schema_path=args.schema)
+                result = match_source_windows(request)
+                total_latency += float(result.get("performance", {}).get("totalLatencyMs", 0.0) or 0.0)
+                results.append({"request_path": str(request_path), "result": result})
+                write_source_window_batch_output(
+                    output_path,
+                    request_count=len(results),
+                    total_latency=total_latency,
+                    results=results,
+                    sequence_assignment=None,
+                    complete=False,
+                )
+        finally:
+            if args.skip_placement:
+                if previous_skip_placement is None:
+                    os.environ.pop("AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT", None)
+                else:
+                    os.environ["AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT"] = previous_skip_placement
+        assignment_rows = []
+        for entry in results:
+            diagnostics = entry.get("result", {}).get("diagnostics", {}) if isinstance(entry.get("result"), dict) else {}
+            candidates = diagnostics.get("rankedCandidates") if isinstance(diagnostics, dict) else None
+            if not isinstance(candidates, list) or not candidates:
+                continue
+            assignment_rows.append(
                 {
-                    "schema_version": "0.1.0",
-                    "request_count": len(results),
-                    "total_match_latency_ms": round(total_latency, 6),
-                    "average_match_latency_ms": round(total_latency / len(results), 6) if results else 0.0,
-                    "results": results,
-                },
-                indent=2,
-                sort_keys=True,
+                    "referenceSegmentId": candidates[0].get("referenceSegmentId"),
+                    "rankedCandidates": candidates,
+                    "microcut": False,
+                }
             )
-            + "\n",
-            encoding="utf-8",
+        sequence_assignment = assign_ranked_reference_sequence(assignment_rows, top_n=max(1, int(args.assignment_top_n))) if assignment_rows else {"selectedPairs": [], "globalScore": 0.0}
+        write_source_window_batch_output(
+            output_path,
+            request_count=len(results),
+            total_latency=total_latency,
+            results=results,
+            sequence_assignment=sequence_assignment,
+            complete=True,
         )
         print(output_path)
         return 0
     if args.command == "validate-source-window-request":
         validate_source_window_request_document(args.request, args.schema)
         print("source-window request validation ok")
+        return 0
+    if args.command == "precompute-visual-cache":
+        report = precompute_visual_cache_for_requests(args.request, args.request_dir, args.schema, limit=args.limit)
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(output_path)
         return 0
     if args.command == "audit-source-window-run":
         report = audit_source_window_run(args.run_dir, fixture_manifest_path=args.fixture_manifest)
@@ -215,6 +258,34 @@ def main(argv: list[str] | None = None) -> int:
     raise AssertionError(f"Unhandled command: {args.command}")
 
 
+def write_source_window_batch_output(
+    output_path: Path,
+    *,
+    request_count: int,
+    total_latency: float,
+    results: list[dict],
+    sequence_assignment: dict | None,
+    complete: bool,
+) -> None:
+    output_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "0.1.0",
+                "complete": complete,
+                "request_count": request_count,
+                "total_match_latency_ms": round(total_latency, 6),
+                "average_match_latency_ms": round(total_latency / request_count, 6) if request_count else 0.0,
+                "sequence_assignment": sequence_assignment,
+                "results": results,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def load_source_window_match_request(path: str | Path, schema_path: str | Path | None = None) -> SourceWindowMatchRequest:
     from .engine import SourceWindowCandidate, SourceWindowMatchRequest
 
@@ -248,8 +319,63 @@ def load_source_window_match_request(path: str | Path, schema_path: str | Path |
         transforms=tuple(document.get("transforms", [])),
         reranker_model_path=str(document["reranker_model_path"]) if document.get("reranker_model_path") else None,
         placement_model_path=str(document["placement_model_path"]) if document.get("placement_model_path") else None,
+        visual_encoder_onnx_path=str(document.get("visual_encoder_onnx_path") or document.get("visualEncoderOnnxPath")) if (document.get("visual_encoder_onnx_path") or document.get("visualEncoderOnnxPath")) else None,
         metadata=dict(document["metadata"]) if isinstance(document.get("metadata"), dict) else None,
     )
+
+
+def precompute_visual_cache_for_requests(explicit_paths: list[str], request_dir: str | None, schema_path: str | Path | None, *, limit: int) -> dict:
+    from .engine import reference_window_duration
+    from .media_window import read_video_frame, source_crop_images
+    from .visual_encoder import VisualEncoderScorer
+
+    request_paths = source_window_batch_request_paths(explicit_paths, request_dir)
+    encoded = 0
+    skipped = 0
+    rows = []
+    scorer_by_path = {}
+    for request_path in request_paths:
+        request = load_source_window_match_request(request_path, schema_path=schema_path)
+        if not request.visual_encoder_onnx_path:
+            skipped += 1
+            rows.append({"request_path": str(request_path), "status": "skipped", "reason": "visual_encoder_onnx_path_missing"})
+            continue
+        scorer = scorer_by_path.get(request.visual_encoder_onnx_path)
+        if scorer is None:
+            scorer = VisualEncoderScorer(request.visual_encoder_onnx_path)
+            scorer_by_path[request.visual_encoder_onnx_path] = scorer
+        from .features import load_feature_manifest
+
+        reference_features = load_feature_manifest(request.reference_feature_manifest_path)
+        reference_window = reference_features.get("source_window") if isinstance(reference_features.get("source_window"), dict) else {}
+        reference_start = int(reference_window.get("source_in", 0) or 0)
+        reference_duration = reference_window_duration(reference_features)
+        fps = float(reference_features.get("fps", 30.0) or 30.0)
+        reference_frame = read_video_frame(request.reference_path, reference_start + max(0, reference_duration // 2), fps)
+        request_encoded = 0
+        if reference_frame is not None:
+            scorer.encode(reference_frame.convert("RGB"))
+            encoded += 1
+            request_encoded += 1
+        for candidate in request.candidates[: max(1, int(limit))]:
+            source_start = int(candidate.source_in)
+            source_end = int(candidate.source_out)
+            source_frame_index = source_start + max(0, (source_end - source_start) // 2)
+            source_frame = read_video_frame(candidate.source_path, source_frame_index, fps)
+            if source_frame is None:
+                continue
+            for crop in source_crop_images(source_frame):
+                scorer.encode(crop)
+                encoded += 1
+                request_encoded += 1
+        rows.append({"request_path": str(request_path), "status": "ok", "encoded_or_cached": request_encoded})
+    return {
+        "schema_version": "0.1.0",
+        "request_count": len(request_paths),
+        "encoded_or_cached": encoded,
+        "skipped_request_count": skipped,
+        "requests": rows,
+    }
 
 
 def source_window_batch_request_paths(explicit_paths: list[str], request_dir: str | None) -> list[Path]:

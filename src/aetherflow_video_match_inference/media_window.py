@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 import io
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -49,7 +50,7 @@ def media_window_rescore(reference_path: str, reference_features: dict[str, Any]
     reference_fps = float(reference_features.get("fps", 30.0) or 30.0)
     source_fps = float(candidate["features"].get("fps", reference_fps) or reference_fps)
     source_duration = source_out - source_in
-    max_start = max(source_in, source_out - reference_duration)
+    max_start = candidate_search_max_start(source_in, source_out, reference_duration)
     identity_rel_frames = sample_relative_frames(reference_duration)
     candidate_starts = candidate_start_grid(source_in, max_start, identity_rel_frames, candidate["features"])
     if not candidate_starts:
@@ -60,23 +61,34 @@ def media_window_rescore(reference_path: str, reference_features: dict[str, Any]
         frame = read_video_frame(reference_path, reference_start + rel_frame, reference_fps)
         if frame is None:
             return None
-        reference_arrays.append(np.asarray(ImageOps.fit(frame.convert("RGB"), COMPARE_SIZE, method=Image.Resampling.BILINEAR), dtype=np.float32) / 255.0)
+        reference_image = frame.convert("RGB")
+        reference_arrays.append(np.asarray(ImageOps.fit(reference_image, COMPARE_SIZE, method=Image.Resampling.BILINEAR), dtype=np.float32) / 255.0)
 
     best = None
     for start_frame in candidate_starts:
-        distance = score_candidate_start(
-            candidate["source_path"],
-            start_frame,
-            identity_rel_frames,
-            source_fps,
-            reference_arrays,
-            np,
-            ImageOps,
-        )
-        if distance is None:
-            continue
-        if best is None or distance < best["distance"]:
-            best = {"distance": distance, "source_in": start_frame, "source_out": min(source_out, start_frame + reference_duration), "microcut": False}
+        for playback_direction in ("forward", "reverse"):
+            distance = score_candidate_start(
+                candidate["source_path"],
+                start_frame,
+                identity_rel_frames,
+                source_fps,
+                reference_arrays,
+                np,
+                ImageOps,
+                reference_duration=reference_duration,
+                playback_direction=playback_direction,
+            )
+            if distance is None:
+                continue
+            if best is None or distance < best["distance"]:
+                best = {
+                    "distance": distance,
+                    "source_in": start_frame,
+                    "source_out": start_frame + reference_duration,
+                    "microcut": False,
+                    "playback_direction": playback_direction,
+                    "temporal_sample_count": len(identity_rel_frames),
+                }
 
     return best
 
@@ -84,8 +96,26 @@ def media_window_rescore(reference_path: str, reference_features: dict[str, Any]
 def sample_relative_frames(duration: int) -> list[int]:
     if duration <= 1:
         return [0]
-    fractions = (0.5,)
+    if duration <= 8:
+        fractions = (0.5,)
+    else:
+        fractions = (0.2, 0.5, 0.8)
     return sorted({max(0, min(duration - 1, int(round((duration - 1) * fraction)))) for fraction in fractions})
+
+
+def candidate_search_max_start(source_in: int, source_out: int, reference_duration: int) -> int:
+    if source_out <= source_in:
+        return source_in
+    if not media_tail_starts_enabled():
+        return max(source_in, source_out - reference_duration)
+    source_duration = source_out - source_in
+    if source_duration <= max(1, reference_duration):
+        return max(source_in, source_out - 1)
+    return max(source_in, source_out - reference_duration)
+
+
+def media_tail_starts_enabled() -> bool:
+    return str(os.environ.get("AETHERFLOW_VIDEO_MATCH_ALLOW_TAIL_STARTS", "")).lower() in {"1", "true", "yes", "on"}
 
 
 def candidate_start_grid(source_in: int, max_start: int, rel_frames: list[int], feature_document: dict[str, Any]) -> list[int]:
@@ -121,7 +151,14 @@ def candidate_start_grid(source_in: int, max_start: int, rel_frames: list[int], 
                 if source_in <= value <= max_start and value not in seen:
                     seen.add(value)
                     ordered.append(value)
-    return ordered[:16]
+    return ordered[:media_start_grid_limit()]
+
+
+def media_start_grid_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("AETHERFLOW_VIDEO_MATCH_START_GRID_LIMIT", "16")))
+    except ValueError:
+        return 16
 
 
 def refine_boundary_start(
@@ -210,19 +247,32 @@ def boundary_start_grid(source_in: int, max_start: int, reference_start: int, re
     return starts[:48]
 
 
-def score_candidate_start(source_path: str, start_frame: int, rel_frames: list[int], fps: float, reference_arrays: list[Any], np: Any, ImageOps: Any) -> float | None:
+def score_candidate_start(
+    source_path: str,
+    start_frame: int,
+    rel_frames: list[int],
+    fps: float,
+    reference_arrays: list[Any],
+    np: Any,
+    ImageOps: Any,
+    *,
+    reference_duration: int | None = None,
+    playback_direction: str = "forward",
+) -> float | None:
     distances = []
     for index, rel_frame in enumerate(rel_frames):
-        source_frame = read_video_frame(source_path, start_frame + rel_frame, fps)
+        source_rel_frame = rel_frame
+        if playback_direction == "reverse" and reference_duration is not None:
+            source_rel_frame = max(0, int(reference_duration) - 1 - int(rel_frame))
+        source_frame = read_video_frame(source_path, start_frame + source_rel_frame, fps)
         if source_frame is None:
             return None
-        distances.append(best_crop_distance(reference_arrays[index], source_frame, np, ImageOps))
+        pixel_distance = best_crop_distance(reference_arrays[index], source_frame, np, ImageOps)
+        distances.append(pixel_distance)
     return round(sum(distances) / len(distances), 6) if distances else None
 
 
-def best_crop_distance(reference_array: Any, source_frame: Any, np: Any, ImageOps: Any) -> float:
-    from PIL import Image
-
+def source_crop_images(source_frame: Any) -> list[Any]:
     source_rgb = source_frame.convert("RGB")
     width, height = source_rgb.size
     candidates = []
@@ -238,9 +288,29 @@ def best_crop_distance(reference_array: Any, source_frame: Any, np: Any, ImageOp
                 if box in seen_boxes:
                     continue
                 seen_boxes.add(box)
-                crop = source_rgb.crop(box)
-                candidates.append(np.asarray(ImageOps.fit(crop, COMPARE_SIZE, method=Image.Resampling.BILINEAR), dtype=np.float32) / 255.0)
+                candidates.append(source_rgb.crop(box))
+    return candidates
+
+
+def best_crop_distance(reference_array: Any, source_frame: Any, np: Any, ImageOps: Any) -> float:
+    candidates = []
+    from PIL import Image
+
+    if low_texture_reference(reference_array, np):
+        source_array = center_vertical_crop_array(source_frame, np, Image, ImageOps)
+        candidates.append(source_array)
+    else:
+        for crop in source_crop_images(source_frame):
+            candidates.append(np.asarray(ImageOps.fit(crop, COMPARE_SIZE, method=Image.Resampling.BILINEAR), dtype=np.float32) / 255.0)
     return min(frame_distance(reference_array, candidate, np) for candidate in candidates)
+
+
+def low_texture_reference(reference_array: Any, np: Any) -> bool:
+    gray = np.mean(reference_array, axis=2)
+    std = float(np.std(gray))
+    dy, dx = np.gradient(gray)
+    edge_mean = float(np.mean(np.sqrt((dx * dx) + (dy * dy))))
+    return edge_mean < 0.025 or (std < 0.08 and edge_mean < 0.04)
 
 
 def frame_distance(reference_array: Any, source_array: Any, np: Any) -> float:
@@ -259,10 +329,16 @@ def frame_distance(reference_array: Any, source_array: Any, np: Any) -> float:
     hist_distance = float(np.mean(np.abs(ref_hist - src_hist))) / 16.0
     edge_distance = structural_edge_distance(reference_array, source_array, np)
     color_distance = (mse * 80.0) + (corr_distance * 25.0) + (hist_distance * 12.0) + (edge_distance * 20.0)
+    if not media_keypoint_scoring_enabled():
+        return color_distance
     keypoint_distance = structural_keypoint_distance(reference_array, source_array, np)
     if keypoint_distance is None:
         return color_distance
     return (color_distance * 0.25) + (keypoint_distance * 0.75)
+
+
+def media_keypoint_scoring_enabled() -> bool:
+    return str(os.environ.get("AETHERFLOW_VIDEO_MATCH_MEDIA_KEYPOINTS", "1")).lower() not in {"0", "false", "no", "off"}
 
 
 def structural_edge_distance(reference_array: Any, source_array: Any, np: Any) -> float:
