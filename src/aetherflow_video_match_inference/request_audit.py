@@ -42,7 +42,7 @@ def audit_source_window_run(run_dir: str | Path, *, fixture_manifest_path: str |
             "selectedSequenceMatchCount": selected_sequence_match_count,
             "oversegmentationRatio": oversegmentation_ratio,
             "allRequestsHavePlacementModelPath": all(row["placementModelPathPresent"] for row in request_rows) if request_rows else False,
-            "candidateCounts": sorted({int(row["candidateCount"]) for row in request_rows}),
+            "candidateCounts": sorted({int(row["candidateCount"]) for row in request_rows if row.get("candidateCount") is not None}),
         },
         "findings": findings,
         "recommendation": recommendation(status, canonical_rows, request_rows),
@@ -72,6 +72,35 @@ def load_request_rows(run_dir: Path) -> list[dict[str, Any]]:
                 "placementModelPathPresent": bool(request.get("placement_model_path")),
                 "requestPath": str(request_path),
                 "referenceFeatureManifestPath": str(reference_features_path),
+            }
+        )
+    return rows if rows else load_report_match_reference_rows(run_dir)
+
+
+def load_report_match_reference_rows(run_dir: Path) -> list[dict[str, Any]]:
+    report_path = run_dir / "footage_sync_match_report.json"
+    if not report_path.exists():
+        return []
+    report = load_json_object(report_path)
+    rows = []
+    for index, match in enumerate(report.get("matches", []) if isinstance(report.get("matches"), list) else [], start=1):
+        if not isinstance(match, dict):
+            continue
+        selected = match.get("selectedCandidate") if isinstance(match.get("selectedCandidate"), dict) else {}
+        reference_range = selected.get("selectedReferenceRange") if isinstance(selected.get("selectedReferenceRange"), dict) else {}
+        start_frame = int(reference_range.get("startFrame", match.get("reference_in", 0)) or 0)
+        end_frame = int(reference_range.get("endFrame", match.get("reference_out", start_frame + 1)) or start_frame + 1)
+        rows.append(
+            {
+                "referenceSegmentId": str(selected.get("referenceSegmentId") or match.get("referenceSegmentId") or f"selected_match_{index:03d}"),
+                "referenceStartFrame": start_frame,
+                "referenceEndFrame": end_frame,
+                "durationFrames": max(0, end_frame - start_frame),
+                "candidateCount": None,
+                "placementModelPathPresent": bool(selected.get("placementCandidatePolicy")),
+                "requestPath": None,
+                "referenceFeatureManifestPath": None,
+                "source": "footage_sync_match_report.selectedCandidate",
             }
         )
     return rows

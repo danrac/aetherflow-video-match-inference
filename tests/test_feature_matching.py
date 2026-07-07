@@ -17,6 +17,7 @@ from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 from aetherflow_video_match_inference.onnx_runtime import validate_onnx_model
 from aetherflow_video_match_inference.placement import pair_features, placement_candidates_for_match, placement_diagnostics, placement_ranking_score, placement_sample_offsets, recommended_transform_candidate
+from aetherflow_video_match_inference.reranker import fragment_tolerant_color_distance
 from aetherflow_video_match_inference.sequence_assignment import assign_ranked_reference_sequence
 
 CONTRACTS_ROOT = Path(__file__).resolve().parents[2] / "contracts"
@@ -241,6 +242,22 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertEqual(selected[0]["candidateSourceSegmentId"], "source-a")
         self.assertEqual(selected[1]["candidateSourceSegmentId"], "source-b")
         self.assertEqual(selected[2]["candidateSourceSegmentId"], "source-c")
+
+    def test_fragment_tolerant_distance_scores_embedded_live_window(self) -> None:
+        reference = feature_doc_from_colors([[10.0, 20.0, 30.0], [20.0, 30.0, 40.0]])
+        noisy_source = feature_doc_from_colors(
+            [
+                [220.0, 220.0, 220.0],
+                [10.0, 20.0, 30.0],
+                [20.0, 30.0, 40.0],
+                [230.0, 230.0, 230.0],
+            ]
+        )
+
+        distance = fragment_tolerant_color_distance(reference, noisy_source)
+
+        self.assertLess(distance, 1.0)
+        self.assertLess(distance, visual_distance(reference, noisy_source) * 0.01)
 
     def test_v3_feature_distance_uses_scene_and_flow_stats(self) -> None:
         reference = {
@@ -1458,6 +1475,19 @@ def write_feature_manifest(
         document["source_window"] = source_window
     write_json(path, document)
     return path
+
+
+def feature_doc_from_colors(colors: list[list[float]]) -> dict:
+    return {
+        "features": [
+            {
+                "frame_index": index,
+                "mean_rgb": color,
+                "active_mean_rgb": color,
+            }
+            for index, color in enumerate(colors)
+        ]
+    }
 
 
 def write_json(path: Path, document: dict) -> None:

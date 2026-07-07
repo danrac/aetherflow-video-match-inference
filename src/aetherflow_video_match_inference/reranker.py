@@ -123,7 +123,7 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
         scored_windows = []
         for candidate in group_candidates:
             scoring_features = reverse_feature_document(candidate["features"]) if is_reverse_reference else candidate["features"]
-            distance = color_distance(reference_features, scoring_features, allow_temporal_reverse=not is_reverse_reference)
+            distance = fragment_tolerant_color_distance(reference_features, scoring_features, allow_temporal_reverse=not is_reverse_reference)
             scored_windows.append(
                 {
                     "candidate_id": candidate["candidate_id"],
@@ -133,8 +133,8 @@ def rank_prepared_candidate_groups(reference_features: dict, prepared_groups: li
                     "distance": distance if distance is not None else float("inf"),
                 }
             )
-        combined_distance = color_distance(reference_features, scoring_combined_features, allow_temporal_reverse=not is_reverse_reference) if scoring_combined_features is not None else None
-        parallel_distance = color_distance(reference_features, scoring_parallel_features, allow_temporal_reverse=not is_reverse_reference) if scoring_parallel_features is not None else None
+        combined_distance = fragment_tolerant_color_distance(reference_features, scoring_combined_features, allow_temporal_reverse=not is_reverse_reference) if scoring_combined_features is not None else None
+        parallel_distance = fragment_tolerant_color_distance(reference_features, scoring_parallel_features, allow_temporal_reverse=not is_reverse_reference) if scoring_parallel_features is not None else None
         panel_layout_distance = (
             parallel_panel_layout_distance(reference_features, scoring_parallel_documents)
             if "split_screen" in reference_transform_types and scoring_parallel_documents
@@ -211,6 +211,61 @@ def use_learned_reranker(transform_types: set[str], model: dict) -> bool:
     protected = set(routing.get("baseline_protected_transform_types") or ["crop", "letterbox", "picture_in_picture", "pillarbox", "scale_position"])
     learned = set(routing.get("learned_reranker_applies_to") or ["reverse", "simple_cut"])
     return bool(transform_types & learned) and not bool(transform_types & protected)
+
+
+def fragment_tolerant_color_distance(reference_features: dict, source_features: dict | None, *, allow_temporal_reverse: bool = True) -> float | None:
+    """Compare a reference against the full source window and stable source subwindows.
+
+    Live scene detection can send windows that are wider or shifted relative to
+    the true editorial shot. Full-window averages then dilute the correct match
+    before media-window refinement has a chance to run. This keeps exact-window
+    behavior unchanged while adding a small deterministic subwindow search for
+    noisy live request shapes.
+    """
+
+    if source_features is None:
+        return None
+    distances = []
+    base_distance = color_distance(reference_features, source_features, allow_temporal_reverse=allow_temporal_reverse)
+    if base_distance is not None:
+        distances.append(base_distance)
+    reference_frames = usable_frames(reference_features)
+    source_frames = usable_frames(source_features)
+    if len(reference_frames) < 2 or len(source_frames) <= len(reference_frames) + 1:
+        return min(distances) if distances else None
+    window_size = len(reference_frames)
+    for start in fragment_probe_starts(len(source_frames), window_size):
+        sliced = feature_document_slice(source_features, start, start + window_size)
+        distance = color_distance(reference_features, sliced, allow_temporal_reverse=allow_temporal_reverse)
+        if distance is not None:
+            distances.append(distance)
+    return min(distances) if distances else None
+
+
+def usable_frames(feature_document: dict) -> list[dict]:
+    return [frame for frame in feature_document.get("features", []) if isinstance(frame, dict)]
+
+
+def fragment_probe_starts(source_count: int, window_size: int) -> list[int]:
+    max_start = max(0, source_count - window_size)
+    if max_start <= 0:
+        return [0]
+    if max_start <= 12:
+        return list(range(max_start + 1))
+    starts = {0, max_start}
+    for fraction in (0.25, 0.5, 0.75):
+        starts.add(round(max_start * fraction))
+    return sorted(starts)
+
+
+def feature_document_slice(feature_document: dict, start: int, end: int) -> dict:
+    frames = usable_frames(feature_document)[start:end]
+    sliced = {key: value for key, value in feature_document.items() if key not in {"features", "temporal_signature", "motion_track_summary", "_aetherflow_feature_cache"}}
+    sliced["features"] = frames
+    if frames:
+        sliced["motion_track_summary"] = motion_track_summary_from_frames(frames)
+        sliced["temporal_signature"] = binned_temporal_signature(frames, bins=8)
+    return sliced
 
 
 def normalize_components(components: dict) -> list[float]:
