@@ -110,7 +110,7 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
         if str(candidate.get("candidate_group_id") or candidate["candidate_id"]) == selected_group_id
     ]
     selected_candidates.sort(key=lambda candidate: (candidate["source_window_entry"].get("role", ""), int(candidate["source_window_entry"].get("source_in", 0)), candidate["candidate_id"]))
-    selected_matches = timed_stage(timings, "timeline_reconstruction", lambda: source_window_matches_from_candidates(request, reference_features, selected_candidates, ranked[0], placement_model))
+    selected_matches = timed_stage(timings, "timeline_reconstruction", lambda: source_window_matches_from_candidates(request, reference_features, selected_candidates, ranked[0], placement_model, ranked_context=ranked))
     return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, ranked, selected_matches, timings, total_start)
 
 
@@ -747,12 +747,13 @@ def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -
     }
 
 
-def source_window_matches_from_candidates(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], top_ranked: dict, placement_model: dict | None = None) -> list[dict]:
+def source_window_matches_from_candidates(request: SourceWindowMatchRequest, reference_features: dict, candidates: list[dict], top_ranked: dict, placement_model: dict | None = None, *, ranked_context: list[dict] | None = None) -> list[dict]:
     reference_duration = reference_window_duration(reference_features)
     source_window_lengths = [source_window_length(candidate["features"]) for candidate in candidates]
     total_window_length = sum(source_window_lengths)
     reference_cursor = 0
     matches = []
+    identity_diagnostics = visual_identity_diagnostics(ranked_context or [top_ranked])
     for index, candidate in enumerate(candidates):
         feature_document = candidate["features"]
         source_in, source_out = source_range(feature_document, reference_duration)
@@ -803,6 +804,7 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
             "group_distance": top_ranked["distance"],
             "raw_group_distance": top_ranked.get("raw_distance"),
             "window_distance": window_distance,
+            "identityDiagnostics": identity_diagnostics,
             "transforms": list(request.transforms),
         }
         if placement is not None:
@@ -816,7 +818,9 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
                 "source_out": source_out,
                 **placement_match_fields(placement),
                 "timeline_track": int(candidate.get("timeline_track", 0)),
-                "confidence": confidence_from_distance(max(0.0, window_distance)),
+                "confidence": calibrated_source_window_confidence(max(0.0, window_distance), identity_diagnostics),
+                "identityConfidence": identity_diagnostics["identityConfidence"],
+                "identityDiagnostics": identity_diagnostics,
                 "reconstruction": {
                     "operation": "source_window_reranker_match",
                     "parameters": reconstruction_parameters,
@@ -869,6 +873,7 @@ def source_window_diagnostics(request: SourceWindowMatchRequest, reference_featu
     reference_end = int(reference_window.get("source_out", reference_start + max(1, int(reference_features.get("duration_frames", 0) or 1))) or reference_start + 1)
     reference_segment_id = str(reference_window.get("source_clip_id") or Path(request.reference_feature_manifest_path).stem)
     selected_id = str(ranked[0]["candidate_id"]) if ranked else ""
+    identity_diagnostics = visual_identity_diagnostics(ranked)
     selected_match_by_candidate_id = {}
     for match in matches or []:
         params = match.get("reconstruction", {}).get("parameters", {}) if isinstance(match.get("reconstruction"), dict) else {}
@@ -889,7 +894,7 @@ def source_window_diagnostics(request: SourceWindowMatchRequest, reference_featu
                 source_start = int(selected_match.get("source_in", source_start))
                 source_end = int(selected_match.get("source_out", source_end))
             window_distance = float(window.get("distance", final_distance) if window.get("distance", final_distance) != float("inf") else final_distance)
-            row_score = confidence_from_distance(window_distance if window_distance != float("inf") else None)
+            row_score = calibrated_source_window_confidence(window_distance, identity_diagnostics) if window_distance != float("inf") else confidence_from_distance(None)
             candidate_rows.append(
                 {
                     "referenceSegmentId": reference_segment_id,
@@ -908,6 +913,7 @@ def source_window_diagnostics(request: SourceWindowMatchRequest, reference_featu
                     "windowCandidateIndex": window_index,
                     "windowCandidatePolicy": window.get("windowCandidatePolicy"),
                     "rankingDiagnostics": ranked_candidate_diagnostics(item, window, ranked_index=ranked_index),
+                    "identityDiagnostics": identity_diagnostics,
                     **ranked_candidate_placement_fields(item, selected_match if window_index == 0 else None),
                 }
             )
@@ -926,7 +932,8 @@ def source_window_diagnostics(request: SourceWindowMatchRequest, reference_featu
                 }
             ] if candidate_rows else [],
             "globalScore": candidate_rows[0]["finalScore"] if candidate_rows else 0.0,
-            "confidenceCalibrationNotes": "Single-reference source-window ranking; batch monotonic assignment is available in fixture evaluation.",
+            "confidenceCalibrationNotes": "Single-reference source-window ranking; confidence is capped when visual identity is weak or ambiguous.",
+            "identityDiagnostics": identity_diagnostics,
         },
     }
 
@@ -969,6 +976,97 @@ def ranked_candidate_diagnostics(item: dict, window: dict, *, ranked_index: int)
             "window_count": components.get("window_count"),
         },
     }
+
+
+def visual_identity_diagnostics(ranked: list[dict]) -> dict:
+    visual_rows = []
+    for index, item in enumerate(ranked):
+        visual = item.get("visual_encoder_window") if isinstance(item.get("visual_encoder_window"), dict) else {}
+        if visual.get("skipped"):
+            continue
+        try:
+            distance = float(visual.get("distance"))
+        except (TypeError, ValueError):
+            continue
+        visual_rows.append(
+            {
+                "candidateId": item.get("candidate_id"),
+                "candidateRank": index + 1,
+                "visualEncoderDistance": round(distance, 6),
+                "visualEncoderScoredDistance": round(float(visual.get("scoredDistance", distance)), 6),
+                "sourceStartFrame": visual.get("source_in"),
+                "sourceEndFrame": visual.get("source_out"),
+                "playbackDirection": visual.get("playback_direction"),
+            }
+        )
+    visual_rows.sort(key=lambda row: (float(row["visualEncoderDistance"]), int(row["candidateRank"])))
+    best = visual_rows[0] if visual_rows else None
+    second = visual_rows[1] if len(visual_rows) > 1 else None
+    best_distance = float(best["visualEncoderDistance"]) if best else None
+    second_distance = float(second["visualEncoderDistance"]) if second else None
+    margin = None
+    if best_distance is not None and second_distance is not None:
+        margin = round(second_distance - best_distance, 6)
+    weak_threshold = visual_identity_weak_distance_threshold()
+    ambiguity_margin = visual_identity_ambiguity_margin()
+    weak = best_distance is None or best_distance >= weak_threshold
+    ambiguous = margin is not None and margin <= ambiguity_margin
+    confidence = 0.35
+    if best_distance is not None:
+        confidence = max(0.05, min(1.0, 1.0 - (best_distance / max(weak_threshold * 1.5, 1e-6))))
+        if ambiguous:
+            confidence *= 0.75
+        if weak:
+            confidence *= 0.55
+    policy = "visual_identity_clear"
+    if not visual_rows:
+        policy = "visual_identity_unavailable"
+    elif weak and ambiguous:
+        policy = "visual_identity_weak_ambiguous"
+    elif weak:
+        policy = "visual_identity_weak"
+    elif ambiguous:
+        policy = "visual_identity_ambiguous"
+    return {
+        "policy": policy,
+        "identityConfidence": round(confidence, 6),
+        "bestVisualDistance": round(best_distance, 6) if best_distance is not None else None,
+        "secondBestVisualDistance": round(second_distance, 6) if second_distance is not None else None,
+        "visualDistanceMargin": margin,
+        "weakVisualIdentity": bool(weak),
+        "ambiguousVisualIdentity": bool(ambiguous),
+        "candidateSetLikelyMissingVisualMatch": bool(weak),
+        "visualCandidateCount": len(visual_rows),
+        "weakDistanceThreshold": weak_threshold,
+        "ambiguityMarginThreshold": ambiguity_margin,
+        "bestCandidate": best,
+        "runnerActionHint": "broaden_or_realign_candidates" if weak else "use_ranked_candidate",
+    }
+
+
+def visual_identity_weak_distance_threshold() -> float:
+    try:
+        return max(0.01, float(os.environ.get("AETHERFLOW_VIDEO_MATCH_VISUAL_WEAK_DISTANCE", "0.18")))
+    except ValueError:
+        return 0.18
+
+
+def visual_identity_ambiguity_margin() -> float:
+    try:
+        return max(0.0, float(os.environ.get("AETHERFLOW_VIDEO_MATCH_VISUAL_AMBIGUITY_MARGIN", "0.025")))
+    except ValueError:
+        return 0.025
+
+
+def calibrated_source_window_confidence(window_distance: float, identity_diagnostics: dict) -> float:
+    base = confidence_from_distance(window_distance)
+    try:
+        identity_confidence = float(identity_diagnostics.get("identityConfidence", base))
+    except (TypeError, ValueError):
+        identity_confidence = base
+    if identity_diagnostics.get("weakVisualIdentity") or identity_diagnostics.get("ambiguousVisualIdentity"):
+        return round(min(base, identity_confidence), 6)
+    return base
 
 
 def reference_window_duration(reference_features: dict) -> int:

@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.cli import load_source_window_match_request, main as cli_main
-from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, match, match_source_windows
+from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, calibrated_source_window_confidence, match, match_source_windows, visual_identity_diagnostics
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 from aetherflow_video_match_inference.media_window import sample_relative_frames, score_candidate_start
@@ -31,6 +31,37 @@ PROFILE_CACHED_EVAL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "
 
 
 class FeatureMatchingTests(unittest.TestCase):
+    def test_visual_identity_diagnostics_flag_weak_candidate_sets(self) -> None:
+        diagnostics = visual_identity_diagnostics(
+            [
+                {
+                    "candidate_id": "source-window-a",
+                    "visual_encoder_window": {
+                        "distance": 0.22,
+                        "scoredDistance": 0.22,
+                        "source_in": 100,
+                        "source_out": 130,
+                        "playback_direction": "forward",
+                    },
+                },
+                {
+                    "candidate_id": "source-window-b",
+                    "visual_encoder_window": {
+                        "distance": 0.24,
+                        "scoredDistance": 0.24,
+                        "source_in": 300,
+                        "source_out": 330,
+                        "playback_direction": "reverse",
+                    },
+                },
+            ]
+        )
+
+        self.assertEqual(diagnostics["policy"], "visual_identity_weak_ambiguous")
+        self.assertTrue(diagnostics["candidateSetLikelyMissingVisualMatch"])
+        self.assertEqual(diagnostics["runnerActionHint"], "broaden_or_realign_candidates")
+        self.assertLess(calibrated_source_window_confidence(10.0, diagnostics), 0.5)
+
     def test_visual_distance_preserves_unit_scaled_feature_differences(self) -> None:
         reference = {
             "features": [
