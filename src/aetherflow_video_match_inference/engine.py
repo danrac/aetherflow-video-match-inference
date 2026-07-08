@@ -216,17 +216,21 @@ def rescore_ranked_source_windows_with_visual_encoder(request: SourceWindowMatch
             rescored.append(updated)
             continue
         visual_distance = float(visual_match["distance"])
+        stability_penalty = broad_window_stability_penalty(item, visual_match)
+        scored_visual_distance = visual_distance + stability_penalty
         feature_distance = float(updated.get("feature_distance", updated.get("raw_distance", updated.get("distance", 0.0))) or 0.0)
         media_distance = None
         media_window = item.get("media_window") if isinstance(item.get("media_window"), dict) else {}
         if isinstance(media_window, dict) and media_window.get("distance") is not None:
             media_distance = float(media_window["distance"])
         feature_weight, media_weight, visual_weight = visual_encoder_blend_weights()
-        blended = (feature_distance * feature_weight) + ((media_distance if media_distance is not None else feature_distance) * media_weight) + (float(visual_distance) * visual_weight)
+        blended = (feature_distance * feature_weight) + ((media_distance if media_distance is not None else feature_distance) * media_weight) + (float(scored_visual_distance) * visual_weight)
         updated["distance"] = round(blended, 6)
         updated["raw_distance"] = updated["distance"]
         updated["visual_encoder_window"] = {
             "distance": round(float(visual_distance), 6),
+            "scoredDistance": round(float(scored_visual_distance), 6),
+            "stabilityPenalty": round(float(stability_penalty), 6),
             "sourceFrame": int(visual_match["source_frame"]),
             "source_in": int(visual_match["source_in"]),
             "source_out": int(visual_match["source_out"]),
@@ -245,6 +249,22 @@ def visual_encoder_scorer_for_path(onnx_path: str) -> VisualEncoderScorer:
         scorer = VisualEncoderScorer(onnx_path)
         _VISUAL_ENCODER_SCORERS[onnx_path] = scorer
     return scorer
+
+
+def broad_window_stability_penalty(item: dict, visual_match: dict) -> float:
+    window = item.get("window_candidates", [{}])[0] if item.get("window_candidates") else {}
+    candidate_id = str(window.get("candidate_id") or item.get("candidate_id") or "")
+    if not candidate_id.startswith("source_window_broad_"):
+        return 0.0
+    try:
+        window_start = int(window.get("candidate_source_in", window.get("source_in", 0)) or 0)
+        window_end = int(window.get("candidate_source_out", window.get("source_out", window_start + 1)) or window_start + 1)
+        visual_start = int(visual_match.get("source_in", window_start))
+    except (TypeError, ValueError):
+        return 0.0
+    duration = max(1, window_end - window_start)
+    drift = abs(visual_start - window_start) / float(duration)
+    return min(0.05, drift * 0.03)
 
 
 def best_visual_source_window(request: SourceWindowMatchRequest, item: dict, reference_features: dict, reference_embeddings: list[tuple[int, tuple[float, ...]]], scorer: VisualEncoderScorer) -> dict | None:
@@ -356,9 +376,9 @@ def annotate_visual_window_candidates(window_candidates: list[dict], visual_matc
 
 def visual_encoder_candidate_limit() -> int:
     try:
-        return max(1, int(os.environ.get("AETHERFLOW_VIDEO_MATCH_VISUAL_RERANK_LIMIT", "8")))
+        return max(1, int(os.environ.get("AETHERFLOW_VIDEO_MATCH_VISUAL_RERANK_LIMIT", "24")))
     except ValueError:
-        return 8
+        return 24
 
 
 def visual_encoder_blend_weights() -> tuple[float, float, float]:
@@ -369,8 +389,8 @@ def visual_encoder_blend_weights() -> tuple[float, float, float]:
             return default
 
     return (
-        value("AETHERFLOW_VIDEO_MATCH_VISUAL_FEATURE_WEIGHT", 0.05),
-        value("AETHERFLOW_VIDEO_MATCH_VISUAL_MEDIA_WEIGHT", 0.05),
+        value("AETHERFLOW_VIDEO_MATCH_VISUAL_FEATURE_WEIGHT", 0.0),
+        value("AETHERFLOW_VIDEO_MATCH_VISUAL_MEDIA_WEIGHT", 0.0),
         value("AETHERFLOW_VIDEO_MATCH_VISUAL_WEIGHT", 80.0),
     )
 
@@ -630,7 +650,7 @@ def placement_for_ranked_candidate(
     if scored_window:
         source_in = int(scored_window.get("source_in", source_in))
         source_out = int(scored_window.get("source_out", source_out))
-        if not scored_window.get("metadata_source_start"):
+        if should_refine_scored_window(scored_window, reference_duration):
             source_in, source_out = refine_selected_source_window(
                 request.reference_path,
                 reference_features,
@@ -673,7 +693,7 @@ def best_scored_window_for_candidate(window_candidates: list[dict], candidate_id
     if isinstance(visual_window, dict):
         preferred_direction = visual_window.get("playback_direction")
 
-    def window_score(item: dict) -> tuple[int, float, int]:
+    def window_score(item: dict) -> tuple[int, int, float]:
         value = item.get("distance")
         if value is None or value == float("inf"):
             value = item.get("visual_encoder_distance")
@@ -686,9 +706,19 @@ def best_scored_window_for_candidate(window_candidates: list[dict], candidate_id
         direction = item.get("playback_direction")
         direction_mismatch = 1 if preferred_direction and direction and direction != preferred_direction else 0
         priority = 0 if item.get("windowCandidatePolicy") in {"visual_grid_alternative", "media_window_alternative"} else 1
-        return direction_mismatch, numeric, priority
+        return direction_mismatch, priority, numeric
 
     return min(matches, key=window_score)
+
+
+def should_refine_scored_window(scored_window: dict, reference_duration: int) -> bool:
+    if scored_window.get("metadata_source_start"):
+        return False
+    if scored_window.get("playback_direction") == "reverse":
+        return False
+    if scored_window.get("visual_encoder_distance") is not None and reference_duration <= 12:
+        return False
+    return True
 
 
 def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -> dict:
@@ -742,7 +772,7 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
         if scored_window:
             source_in = int(scored_window.get("source_in", source_in))
             source_out = int(scored_window.get("source_out", source_out))
-            if not scored_window.get("metadata_source_start"):
+            if should_refine_scored_window(scored_window, reference_duration):
                 source_in, source_out = refine_selected_source_window(
                     request.reference_path,
                     reference_features,
@@ -923,6 +953,8 @@ def ranked_candidate_diagnostics(item: dict, window: dict, *, ranked_index: int)
         "mediaSkipped": media.get("skipped"),
         "mediaSkipReason": media.get("reason"),
         "visualEncoderDistance": visual.get("distance"),
+        "visualEncoderScoredDistance": visual.get("scoredDistance"),
+        "visualEncoderStabilityPenalty": visual.get("stabilityPenalty"),
         "visualEncoderPlaybackDirection": visual.get("playback_direction"),
         "visualEncoderSkipped": visual.get("skipped"),
         "visualEncoderSkipReason": visual.get("reason"),

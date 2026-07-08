@@ -64,6 +64,11 @@ def visual_encoder_session(onnx_path: str, providers: tuple[str, ...]):
     try:
         return ort.InferenceSession(str(path), providers=provider_list)
     except Exception as exc:  # pragma: no cover - provider-specific
+        if provider_list != ["CPUExecutionProvider"] and "CPUExecutionProvider" in available:
+            try:
+                return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            except Exception:
+                pass
         raise VisualEncoderUnavailable(str(exc)) from exc
 
 
