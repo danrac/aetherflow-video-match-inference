@@ -130,6 +130,8 @@ def rescore_ranked_source_windows_with_media(request: SourceWindowMatchRequest, 
         return ranked
     if trusted_canonical_metadata_available(request, reference_features, candidates):
         return [ranked_candidate_with_skipped_media(item, "trusted_canonical_metadata_available") for item in ranked]
+    if broad_visual_fast_path_enabled(request, ranked):
+        return [ranked_candidate_with_skipped_media(item, "broad_visual_fast_path") for item in ranked]
     candidate_by_group = {str(candidate.get("candidate_group_id") or candidate["candidate_id"]): candidate for candidate in candidates}
     rescored = []
     media_rescore_limit = media_window_rescore_limit()
@@ -164,6 +166,13 @@ def media_window_rescore_limit() -> int:
         return max(1, int(os.environ.get("AETHERFLOW_VIDEO_MATCH_MEDIA_RESCORE_LIMIT", "6")))
     except ValueError:
         return 6
+
+
+def broad_visual_fast_path_enabled(request: SourceWindowMatchRequest, ranked: list[dict]) -> bool:
+    if not request.visual_encoder_onnx_path or len(ranked) <= 8:
+        return False
+    value = str(os.environ.get("AETHERFLOW_VIDEO_MATCH_BROAD_VISUAL_FAST_PATH", "1")).lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def rescore_ranked_source_windows_with_visual_encoder(request: SourceWindowMatchRequest, reference_features: dict, ranked: list[dict]) -> list[dict]:
@@ -361,8 +370,8 @@ def visual_encoder_blend_weights() -> tuple[float, float, float]:
 
     return (
         value("AETHERFLOW_VIDEO_MATCH_VISUAL_FEATURE_WEIGHT", 0.05),
-        value("AETHERFLOW_VIDEO_MATCH_VISUAL_MEDIA_WEIGHT", 0.10),
-        value("AETHERFLOW_VIDEO_MATCH_VISUAL_WEIGHT", 15.0),
+        value("AETHERFLOW_VIDEO_MATCH_VISUAL_MEDIA_WEIGHT", 0.05),
+        value("AETHERFLOW_VIDEO_MATCH_VISUAL_WEIGHT", 80.0),
     )
 
 
@@ -553,7 +562,7 @@ def attach_placement_to_ranked_candidates(
     for candidate in candidates:
         group_id = str(candidate.get("candidate_group_id") or candidate["candidate_id"])
         candidate_groups.setdefault(group_id, []).append(candidate)
-    placement_limit = ranked_placement_candidate_limit(placement_model)
+    placement_limit = ranked_placement_candidate_limit(placement_model, ranked_candidate_count=len(ranked))
     enriched = []
     for rank_index, item in enumerate(ranked):
         updated = dict(item)
@@ -574,7 +583,21 @@ def attach_placement_to_ranked_candidates(
     return enriched
 
 
-def ranked_placement_candidate_limit(placement_model: dict) -> int:
+def ranked_placement_candidate_limit(placement_model: dict, *, ranked_candidate_count: int | None = None) -> int:
+    env_value = os.environ.get("AETHERFLOW_VIDEO_MATCH_RANKED_PLACEMENT_LIMIT")
+    if env_value is not None:
+        try:
+            return max(0, int(env_value))
+        except ValueError:
+            pass
+    if ranked_candidate_count is not None and ranked_candidate_count > 8:
+        env_broad_value = os.environ.get("AETHERFLOW_VIDEO_MATCH_BROAD_RANKED_PLACEMENT_LIMIT")
+        if env_broad_value is not None:
+            try:
+                return max(0, int(env_broad_value))
+            except ValueError:
+                pass
+        return 1
     configured = placement_model.get("ranked_candidate_output_limit") if isinstance(placement_model, dict) else None
     try:
         limit = int(configured)
@@ -603,7 +626,7 @@ def placement_for_ranked_candidate(
     candidate = representative_candidate_for_ranked_item(candidates, ranked_item)
     reference_duration = reference_window_duration(reference_features)
     source_in, source_out = source_range(candidate["features"], reference_duration)
-    scored_window = next((item for item in ranked_item.get("window_candidates", []) if item.get("candidate_id") == candidate["candidate_id"]), None)
+    scored_window = best_scored_window_for_candidate(ranked_item.get("window_candidates", []), candidate["candidate_id"], ranked_item=ranked_item)
     if scored_window:
         source_in = int(scored_window.get("source_in", source_in))
         source_out = int(scored_window.get("source_out", source_out))
@@ -638,6 +661,34 @@ def representative_candidate_for_ranked_item(candidates: list[dict], ranked_item
             if str(candidate.get("candidate_id", "")) == best_candidate_id:
                 return candidate
     return candidates[0]
+
+
+def best_scored_window_for_candidate(window_candidates: list[dict], candidate_id: str, *, ranked_item: dict | None = None) -> dict | None:
+    matches = [item for item in window_candidates if str(item.get("candidate_id", "")) == str(candidate_id)]
+    if not matches:
+        return None
+
+    preferred_direction = None
+    visual_window = ranked_item.get("visual_encoder_window") if isinstance(ranked_item, dict) and isinstance(ranked_item.get("visual_encoder_window"), dict) else {}
+    if isinstance(visual_window, dict):
+        preferred_direction = visual_window.get("playback_direction")
+
+    def window_score(item: dict) -> tuple[int, float, int]:
+        value = item.get("distance")
+        if value is None or value == float("inf"):
+            value = item.get("visual_encoder_distance")
+        if value is None or value == float("inf"):
+            value = item.get("media_distance")
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = float("inf")
+        direction = item.get("playback_direction")
+        direction_mismatch = 1 if preferred_direction and direction and direction != preferred_direction else 0
+        priority = 0 if item.get("windowCandidatePolicy") in {"visual_grid_alternative", "media_window_alternative"} else 1
+        return direction_mismatch, numeric, priority
+
+    return min(matches, key=window_score)
 
 
 def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -> dict:
@@ -686,7 +737,7 @@ def source_window_matches_from_candidates(request: SourceWindowMatchRequest, ref
         else:
             reference_in = 0
             reference_out = max(1, min(reference_duration or source_duration, source_duration))
-        scored_window = next((item for item in top_ranked.get("window_candidates", []) if item.get("candidate_id") == candidate["candidate_id"]), None)
+        scored_window = best_scored_window_for_candidate(top_ranked.get("window_candidates", []), candidate["candidate_id"], ranked_item=top_ranked)
         window_distance = float(scored_window["distance"]) if scored_window and scored_window.get("distance") != float("inf") else float(top_ranked["distance"])
         if scored_window:
             source_in = int(scored_window.get("source_in", source_in))
@@ -795,7 +846,7 @@ def source_window_diagnostics(request: SourceWindowMatchRequest, reference_featu
         if candidate_id_for_match:
             selected_match_by_candidate_id[candidate_id_for_match] = match
     candidate_rows = []
-    for item in ranked:
+    for ranked_index, item in enumerate(ranked):
         candidate_id = str(item.get("candidate_id", ""))
         raw_distance = float(item.get("raw_distance", item.get("distance", float("inf"))))
         final_distance = float(item.get("distance", float("inf")))
@@ -823,8 +874,10 @@ def source_window_diagnostics(request: SourceWindowMatchRequest, reference_featu
                     "finalScore": row_score,
                     "selected": candidate_id == selected_id and window_index == 0,
                     "rejectionReason": "" if candidate_id == selected_id and window_index == 0 else "lower_ranked_candidate",
+                    "candidateRank": ranked_index + 1,
                     "windowCandidateIndex": window_index,
                     "windowCandidatePolicy": window.get("windowCandidatePolicy"),
+                    "rankingDiagnostics": ranked_candidate_diagnostics(item, window, ranked_index=ranked_index),
                     **ranked_candidate_placement_fields(item, selected_match if window_index == 0 else None),
                 }
             )
@@ -852,6 +905,38 @@ def candidate_source_segment_id(candidate_id: str) -> str:
     if "_refcut_" in candidate_id:
         return candidate_id.split("_refcut_", 1)[0]
     return candidate_id
+
+
+def ranked_candidate_diagnostics(item: dict, window: dict, *, ranked_index: int) -> dict:
+    media = item.get("media_window") if isinstance(item.get("media_window"), dict) else {}
+    visual = item.get("visual_encoder_window") if isinstance(item.get("visual_encoder_window"), dict) else {}
+    components = item.get("components") if isinstance(item.get("components"), dict) else {}
+    return {
+        "candidateRank": ranked_index + 1,
+        "candidateId": item.get("candidate_id"),
+        "groupDistance": item.get("distance"),
+        "rawGroupDistance": item.get("raw_distance"),
+        "featureDistance": item.get("feature_distance"),
+        "windowDistance": window.get("distance"),
+        "mediaDistance": media.get("distance"),
+        "mediaPlaybackDirection": media.get("playback_direction"),
+        "mediaSkipped": media.get("skipped"),
+        "mediaSkipReason": media.get("reason"),
+        "visualEncoderDistance": visual.get("distance"),
+        "visualEncoderPlaybackDirection": visual.get("playback_direction"),
+        "visualEncoderSkipped": visual.get("skipped"),
+        "visualEncoderSkipReason": visual.get("reason"),
+        "candidatePlaybackDirection": window.get("playback_direction"),
+        "components": {
+            "combined_visual": components.get("combined_visual"),
+            "average_window": components.get("average_window"),
+            "tail_visual": components.get("tail_visual"),
+            "segment_sequence": components.get("segment_sequence"),
+            "spatial_transform": components.get("spatial_transform"),
+            "family_penalty": components.get("family_penalty"),
+            "window_count": components.get("window_count"),
+        },
+    }
 
 
 def reference_window_duration(reference_features: dict) -> int:

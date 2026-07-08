@@ -11,10 +11,11 @@ def assign_ranked_reference_sequence(rows: list[dict[str, Any]], *, top_n: int =
     if not assignment_rows:
         return {"selectedPairs": [], "skippedSourceSegments": [], "globalScore": 0.0}
 
+    enforce_unique_segments = unique_source_segments_available(assignment_rows, top_n=top_n) >= len(assignment_rows)
     serial = count()
     beams = [{"score": 0.0, "path": [], "windows": []}]
     for row in assignment_rows:
-        candidates = row.get("rankedCandidates", [])[:top_n]
+        candidates = unique_ranked_candidates(row.get("rankedCandidates", []))[:top_n]
         if not candidates:
             continue
         next_beams = []
@@ -22,7 +23,7 @@ def assign_ranked_reference_sequence(rows: list[dict[str, Any]], *, top_n: int =
             for rank_index, candidate in enumerate(candidates):
                 pair = candidate_pair(row, candidate, rank_index)
                 window = candidate_window(pair)
-                transition = transition_score(beam["windows"], window)
+                transition = transition_score(beam["windows"], window, enforce_unique_segments=enforce_unique_segments)
                 next_beams.append(
                     {
                         "score": float(beam["score"]) + float(pair["score"]) + transition,
@@ -38,7 +39,7 @@ def assign_ranked_reference_sequence(rows: list[dict[str, Any]], *, top_n: int =
     seen_segments = {
         str(candidate.get("candidateSourceSegmentId"))
         for row in assignment_rows
-        for candidate in row.get("rankedCandidates", [])[:top_n]
+        for candidate in unique_ranked_candidates(row.get("rankedCandidates", []))[:top_n]
         if candidate.get("candidateSourceSegmentId")
     }
     return {
@@ -46,6 +47,11 @@ def assign_ranked_reference_sequence(rows: list[dict[str, Any]], *, top_n: int =
         "selectedPairs": selected_pairs,
         "skippedSourceSegments": sorted(seen_segments - used_segments),
         "globalScore": round(float(best["score"]) / max(1, len(selected_pairs)), 6),
+        "assignmentDiagnostics": {
+            "enforceUniqueSourceSegments": enforce_unique_segments,
+            "uniqueSourceSegmentCount": unique_source_segments_available(assignment_rows, top_n=top_n),
+            "referenceRowCount": len(assignment_rows),
+        },
     }
 
 
@@ -70,9 +76,37 @@ def candidate_window(pair: dict[str, Any]) -> tuple[str, int, int]:
     )
 
 
-def transition_score(previous_windows: list[tuple[str, int, int]], current_window: tuple[str, int, int]) -> float:
+def unique_source_segments_available(rows: list[dict[str, Any]], *, top_n: int) -> int:
+    segments = {
+        str(candidate.get("candidateSourceSegmentId"))
+        for row in rows
+        for candidate in unique_ranked_candidates(row.get("rankedCandidates", []))[:top_n]
+        if candidate.get("candidateSourceSegmentId")
+    }
+    return len(segments)
+
+
+def unique_ranked_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        segment_id = candidate.get("candidateSourceSegmentId")
+        if not segment_id:
+            unique.append(candidate)
+            continue
+        key = str(segment_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def transition_score(previous_windows: list[tuple[str, int, int]], current_window: tuple[str, int, int], *, enforce_unique_segments: bool = False) -> float:
     current_segment, current_start, current_end = current_window
     score = 0.0
+    if enforce_unique_segments and any(previous_segment == current_segment for previous_segment, _previous_start, _previous_end in previous_windows):
+        return -10.0
     if previous_windows:
         previous_segment, previous_start, _previous_end = previous_windows[-1]
         if current_segment == previous_segment:

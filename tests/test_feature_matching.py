@@ -264,6 +264,33 @@ class FeatureMatchingTests(unittest.TestCase):
         self.assertEqual(selected[1]["candidateSourceSegmentId"], "source-a")
         self.assertEqual(selected[2]["candidateSourceSegmentId"], "source-b")
 
+    def test_sequence_assignment_enforces_unique_sources_when_available(self) -> None:
+        rows = [
+            sequence_row("reference-a", [sequence_candidate("source-a", 100, 160, 0.91)]),
+            sequence_row(
+                "reference-b",
+                [
+                    sequence_candidate("source-a", 162, 220, 0.96),
+                    sequence_candidate("source-b", 300, 360, 0.89),
+                ],
+            ),
+            sequence_row(
+                "reference-c",
+                [
+                    sequence_candidate("source-b", 300, 360, 0.93),
+                    sequence_candidate("source-c", 500, 560, 0.88),
+                ],
+            ),
+        ]
+
+        assignment = assign_ranked_reference_sequence(rows, top_n=2)
+
+        selected = assignment["selectedPairs"]
+        self.assertEqual(selected[0]["candidateSourceSegmentId"], "source-a")
+        self.assertEqual(selected[1]["candidateSourceSegmentId"], "source-b")
+        self.assertEqual(selected[2]["candidateSourceSegmentId"], "source-c")
+        self.assertTrue(assignment["assignmentDiagnostics"]["enforceUniqueSourceSegments"])
+
     def test_fragment_tolerant_distance_scores_embedded_live_window(self) -> None:
         reference = feature_doc_from_colors([[10.0, 20.0, 30.0], [20.0, 30.0, 40.0]])
         noisy_source = feature_doc_from_colors(
