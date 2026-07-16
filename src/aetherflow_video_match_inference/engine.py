@@ -1,6 +1,6 @@
 """Inference engine boundary."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
@@ -52,6 +52,84 @@ class SourceWindowMatchRequest:
     metadata: dict | None = None
 
 
+@dataclass
+class SourceWindowBatchCache:
+    """Shared model/feature cache for batch source-window inference."""
+
+    model_manifests: dict[str, dict] = field(default_factory=dict)
+    feature_manifests: dict[str, dict] = field(default_factory=dict)
+    reranker_models: dict[str, dict | None] = field(default_factory=dict)
+    placement_models: dict[str, dict | None] = field(default_factory=dict)
+    stats: dict[str, int] = field(
+        default_factory=lambda: {
+            "model_manifest_hits": 0,
+            "model_manifest_misses": 0,
+            "feature_manifest_hits": 0,
+            "feature_manifest_misses": 0,
+            "reranker_model_hits": 0,
+            "reranker_model_misses": 0,
+            "placement_model_hits": 0,
+            "placement_model_misses": 0,
+        }
+    )
+
+    def load_model_manifest(self, path: str | Path) -> dict:
+        key = normalized_cache_key(path)
+        cached = self.model_manifests.get(key)
+        if cached is not None:
+            self.stats["model_manifest_hits"] += 1
+            return cached
+        self.stats["model_manifest_misses"] += 1
+        loaded = load_model_manifest(path)
+        self.model_manifests[key] = loaded
+        return loaded
+
+    def load_feature_manifest(self, path: str | Path) -> dict:
+        key = normalized_cache_key(path)
+        cached = self.feature_manifests.get(key)
+        if cached is not None:
+            self.stats["feature_manifest_hits"] += 1
+            return feature_working_copy(cached)
+        self.stats["feature_manifest_misses"] += 1
+        loaded = load_feature_manifest(path)
+        self.feature_manifests[key] = loaded
+        return feature_working_copy(loaded)
+
+    def load_reranker_model(self, path: str | Path | None) -> dict | None:
+        if not path:
+            return None
+        key = normalized_cache_key(path)
+        if key in self.reranker_models:
+            self.stats["reranker_model_hits"] += 1
+            return self.reranker_models[key]
+        self.stats["reranker_model_misses"] += 1
+        loaded = load_reranker_model(path)
+        self.reranker_models[key] = loaded
+        return loaded
+
+    def load_placement_model(self, path: str | Path | None) -> dict | None:
+        if not path:
+            return None
+        key = normalized_cache_key(path)
+        if key in self.placement_models:
+            self.stats["placement_model_hits"] += 1
+            return self.placement_models[key]
+        self.stats["placement_model_misses"] += 1
+        loaded = load_placement_model(path)
+        self.placement_models[key] = loaded
+        return loaded
+
+    def report(self) -> dict:
+        return {
+            "schema_version": "0.1.0",
+            "stats": dict(self.stats),
+            "cached_model_manifest_count": len(self.model_manifests),
+            "cached_feature_manifest_count": len(self.feature_manifests),
+            "cached_reranker_model_count": len(self.reranker_models),
+            "cached_placement_model_count": len(self.placement_models),
+        }
+
+
 def describe_request(request: MatchRequest) -> dict[str, object]:
     return {
         "reference_path": request.reference_path,
@@ -85,16 +163,31 @@ def load_model_manifest(path: str | Path) -> dict:
     return document
 
 
-def match_source_windows(request: SourceWindowMatchRequest) -> dict:
+def normalized_cache_key(path: str | Path) -> str:
+    return str(Path(path).expanduser().resolve(strict=False))
+
+
+def feature_working_copy(feature_document: dict) -> dict:
+    return {key: value for key, value in feature_document.items() if key != "_aetherflow_feature_cache"}
+
+
+def match_source_windows(request: SourceWindowMatchRequest, batch_cache: SourceWindowBatchCache | None = None) -> dict:
     """Rank explicit grouped source-window candidates and reconstruct timeline edits."""
 
     timings: list[dict[str, float | str]] = []
     total_start = perf_counter()
-    model_manifest = load_model_manifest(request.model_manifest_path)
-    reference_features = timed_stage(timings, "feature_loading.reference", lambda: load_feature_manifest(request.reference_feature_manifest_path))
-    reranker_model = timed_stage(timings, "model_loading.reranker", lambda: load_reranker_model(request.reranker_model_path) if request.reranker_model_path else None)
-    placement_model = timed_stage(timings, "model_loading.placement", lambda: None if source_window_skip_placement_enabled() else (load_placement_model(request.placement_model_path) if request.placement_model_path else None))
-    candidates = timed_stage(timings, "feature_loading.candidates", lambda: [source_window_candidate_to_scoring_input(candidate) for candidate in request.candidates])
+    model_manifest = timed_stage(timings, "model_loading.manifest", lambda: batch_cache.load_model_manifest(request.model_manifest_path) if batch_cache else load_model_manifest(request.model_manifest_path))
+    reference_features = timed_stage(timings, "feature_loading.reference", lambda: batch_cache.load_feature_manifest(request.reference_feature_manifest_path) if batch_cache else load_feature_manifest(request.reference_feature_manifest_path))
+    reranker_model = timed_stage(timings, "model_loading.reranker", lambda: batch_cache.load_reranker_model(request.reranker_model_path) if batch_cache else (load_reranker_model(request.reranker_model_path) if request.reranker_model_path else None))
+    placement_model = timed_stage(
+        timings,
+        "model_loading.placement",
+        lambda: None
+        if source_window_skip_placement_enabled()
+        else (batch_cache.load_placement_model(request.placement_model_path) if batch_cache else (load_placement_model(request.placement_model_path) if request.placement_model_path else None)),
+    )
+    feature_loader = batch_cache.load_feature_manifest if batch_cache else load_feature_manifest
+    candidates = timed_stage(timings, "feature_loading.candidates", lambda: [source_window_candidate_to_scoring_input(candidate, feature_loader=feature_loader) for candidate in request.candidates])
     ranked = timed_stage(timings, "source_window_scoring", lambda: rank_candidates(reference_features, candidates, list(request.transforms), reranker_model))
     ranked = timed_stage(timings, "media_window_rescore", lambda: rescore_ranked_source_windows_with_media(request, reference_features, candidates, ranked))
     ranked = timed_stage(timings, "visual_encoder_rescore", lambda: rescore_ranked_source_windows_with_visual_encoder(request, reference_features, ranked))
@@ -112,6 +205,52 @@ def match_source_windows(request: SourceWindowMatchRequest) -> dict:
     selected_candidates.sort(key=lambda candidate: (candidate["source_window_entry"].get("role", ""), int(candidate["source_window_entry"].get("source_in", 0)), candidate["candidate_id"]))
     selected_matches = timed_stage(timings, "timeline_reconstruction", lambda: source_window_matches_from_candidates(request, reference_features, selected_candidates, ranked[0], placement_model, ranked_context=ranked))
     return source_window_result(request, model_manifest, reference_features, reranker_model, placement_model, ranked, selected_matches, timings, total_start)
+
+
+def match_source_windows_batch(requests: list[SourceWindowMatchRequest], *, assignment_top_n: int = 12) -> dict:
+    """Run source-window matching for a batch while reusing loaded features/models."""
+
+    from .sequence_assignment import assign_ranked_reference_sequence
+
+    total_start = perf_counter()
+    cache = SourceWindowBatchCache()
+    results = []
+    total_latency = 0.0
+    for index, request in enumerate(requests):
+        request_start = perf_counter()
+        result = match_source_windows(request, batch_cache=cache)
+        request_wall_latency = (perf_counter() - request_start) * 1000.0
+        result.setdefault("performance", {})["batchRequestWallLatencyMs"] = round(request_wall_latency, 6)
+        result["performance"]["batchRequestIndex"] = index
+        total_latency += float(result.get("performance", {}).get("totalLatencyMs", 0.0) or 0.0)
+        results.append({"request_index": index, "result": result})
+    assignment_rows = []
+    for entry in results:
+        diagnostics = entry.get("result", {}).get("diagnostics", {}) if isinstance(entry.get("result"), dict) else {}
+        candidates = diagnostics.get("rankedCandidates") if isinstance(diagnostics, dict) else None
+        if not isinstance(candidates, list) or not candidates:
+            continue
+        assignment_rows.append(
+            {
+                "referenceSegmentId": candidates[0].get("referenceSegmentId"),
+                "rankedCandidates": candidates,
+                "microcut": False,
+            }
+        )
+    sequence_assignment = assign_ranked_reference_sequence(assignment_rows, top_n=max(1, int(assignment_top_n))) if assignment_rows else {"selectedPairs": [], "globalScore": 0.0}
+    wall_latency = (perf_counter() - total_start) * 1000.0
+    return {
+        "schema_version": "0.1.0",
+        "complete": True,
+        "request_count": len(requests),
+        "total_match_latency_ms": round(total_latency, 6),
+        "average_match_latency_ms": round(total_latency / len(requests), 6) if requests else 0.0,
+        "batch_wall_latency_ms": round(wall_latency, 6),
+        "average_batch_wall_latency_ms": round(wall_latency / len(requests), 6) if requests else 0.0,
+        "cache": cache.report(),
+        "sequence_assignment": sequence_assignment,
+        "results": results,
+    }
 
 
 def timed_stage(timings: list[dict[str, float | str]], stage: str, callback):
@@ -721,8 +860,8 @@ def should_refine_scored_window(scored_window: dict, reference_duration: int) ->
     return True
 
 
-def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate) -> dict:
-    feature_document = load_feature_manifest(candidate.feature_manifest_path)
+def source_window_candidate_to_scoring_input(candidate: SourceWindowCandidate, *, feature_loader=load_feature_manifest) -> dict:
+    feature_document = feature_loader(candidate.feature_manifest_path)
     entry = {
         "source_clip_id": candidate.source_clip_id,
         "source_in": candidate.source_in,

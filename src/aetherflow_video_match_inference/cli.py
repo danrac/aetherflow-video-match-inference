@@ -131,58 +131,47 @@ def main(argv: list[str] | None = None) -> int:
         print(output_path)
         return 0
     if args.command == "match-source-windows-batch":
-        from .engine import match_source_windows
-        from .sequence_assignment import assign_ranked_reference_sequence
+        from .engine import match_source_windows_batch
 
         request_paths = source_window_batch_request_paths(args.request, args.request_dir)
-        results = []
-        total_latency = 0.0
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         previous_skip_placement = os.environ.get("AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT")
         if args.skip_placement:
             os.environ["AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT"] = "1"
         try:
+            requests = []
             for request_path in request_paths:
-                request = load_source_window_match_request(request_path, schema_path=args.schema)
-                result = match_source_windows(request)
-                total_latency += float(result.get("performance", {}).get("totalLatencyMs", 0.0) or 0.0)
-                results.append({"request_path": str(request_path), "result": result})
+                requests.append(load_source_window_match_request(request_path, schema_path=args.schema))
                 write_source_window_batch_output(
                     output_path,
-                    request_count=len(results),
-                    total_latency=total_latency,
-                    results=results,
+                    request_count=len(requests),
+                    total_latency=0.0,
+                    results=[{"request_path": str(path), "result": None} for path in request_paths[: len(requests)]],
                     sequence_assignment=None,
                     complete=False,
                 )
+            batch_result = match_source_windows_batch(requests, assignment_top_n=max(1, int(args.assignment_top_n)))
         finally:
             if args.skip_placement:
                 if previous_skip_placement is None:
                     os.environ.pop("AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT", None)
                 else:
                     os.environ["AETHERFLOW_VIDEO_MATCH_SKIP_PLACEMENT"] = previous_skip_placement
-        assignment_rows = []
-        for entry in results:
-            diagnostics = entry.get("result", {}).get("diagnostics", {}) if isinstance(entry.get("result"), dict) else {}
-            candidates = diagnostics.get("rankedCandidates") if isinstance(diagnostics, dict) else None
-            if not isinstance(candidates, list) or not candidates:
-                continue
-            assignment_rows.append(
-                {
-                    "referenceSegmentId": candidates[0].get("referenceSegmentId"),
-                    "rankedCandidates": candidates,
-                    "microcut": False,
-                }
-            )
-        sequence_assignment = assign_ranked_reference_sequence(assignment_rows, top_n=max(1, int(args.assignment_top_n))) if assignment_rows else {"selectedPairs": [], "globalScore": 0.0}
+        results = []
+        for request_path, entry in zip(request_paths, batch_result.get("results", []), strict=False):
+            result_entry = dict(entry)
+            result_entry["request_path"] = str(request_path)
+            results.append(result_entry)
         write_source_window_batch_output(
             output_path,
-            request_count=len(results),
-            total_latency=total_latency,
+            request_count=int(batch_result.get("request_count", len(results)) or len(results)),
+            total_latency=float(batch_result.get("total_match_latency_ms", 0.0) or 0.0),
             results=results,
-            sequence_assignment=sequence_assignment,
+            sequence_assignment=batch_result.get("sequence_assignment"),
             complete=True,
+            batch_wall_latency=float(batch_result.get("batch_wall_latency_ms", 0.0) or 0.0),
+            cache=batch_result.get("cache") if isinstance(batch_result.get("cache"), dict) else None,
         )
         print(output_path)
         return 0
@@ -266,21 +255,25 @@ def write_source_window_batch_output(
     results: list[dict],
     sequence_assignment: dict | None,
     complete: bool,
+    batch_wall_latency: float | None = None,
+    cache: dict | None = None,
 ) -> None:
+    document = {
+        "schema_version": "0.1.0",
+        "complete": complete,
+        "request_count": request_count,
+        "total_match_latency_ms": round(total_latency, 6),
+        "average_match_latency_ms": round(total_latency / request_count, 6) if request_count else 0.0,
+        "sequence_assignment": sequence_assignment,
+        "results": results,
+    }
+    if batch_wall_latency is not None:
+        document["batch_wall_latency_ms"] = round(batch_wall_latency, 6)
+        document["average_batch_wall_latency_ms"] = round(batch_wall_latency / request_count, 6) if request_count else 0.0
+    if cache is not None:
+        document["cache"] = cache
     output_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "0.1.0",
-                "complete": complete,
-                "request_count": request_count,
-                "total_match_latency_ms": round(total_latency, 6),
-                "average_match_latency_ms": round(total_latency / request_count, 6) if request_count else 0.0,
-                "sequence_assignment": sequence_assignment,
-                "results": results,
-            },
-            indent=2,
-            sort_keys=True,
-        )
+        json.dumps(document, indent=2, sort_keys=True)
         + "\n",
         encoding="utf-8",
     )

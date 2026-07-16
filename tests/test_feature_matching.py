@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from aetherflow_video_match_inference.adapters import to_host_payload
 from aetherflow_video_match_inference.cli import load_source_window_match_request, main as cli_main
-from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, calibrated_source_window_confidence, match, match_source_windows, visual_identity_diagnostics
+from aetherflow_video_match_inference.engine import MatchRequest, SourceWindowCandidate, SourceWindowMatchRequest, calibrated_source_window_confidence, match, match_source_windows, match_source_windows_batch, visual_identity_diagnostics
 from aetherflow_video_match_inference.features import visual_distance
 from aetherflow_video_match_inference.interchange import export_after_effects_extendscript, export_cep_json, export_edit_json, export_edl, export_premiere_json, frames_to_timecode
 from aetherflow_video_match_inference.media_window import sample_relative_frames, score_candidate_start
@@ -958,6 +958,108 @@ class FeatureMatchingTests(unittest.TestCase):
             self.assertEqual(result["request_count"], 1)
             self.assertEqual(result["results"][0]["result"]["matches"][0]["source_in"], 3)
             self.assertIn("total_match_latency_ms", result)
+            self.assertIn("batch_wall_latency_ms", result)
+            self.assertEqual(result["cache"]["cached_model_manifest_count"], 1)
+            self.assertGreaterEqual(result["cache"]["cached_feature_manifest_count"], 2)
+
+    def test_source_window_batch_matches_single_request_outputs_and_preserves_order(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-batch-api-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_a = write_feature_manifest(root / "reference-a.features.json", "reference-a", [100.0, 120.0, 140.0])
+            reference_b = write_feature_manifest(root / "reference-b.features.json", "reference-b", [20.0, 40.0, 60.0])
+            source_a = write_feature_manifest(root / "source-a.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            source_b = write_feature_manifest(root / "source-b.features.json", "clip-b", [21.0, 41.0, 61.0], source_window={"source_in": 40, "source_out": 64})
+            request_a = SourceWindowMatchRequest(
+                reference_path="/tmp/reference-a.mp4",
+                model_manifest_path=str(model_manifest),
+                reference_feature_manifest_path=str(reference_a),
+                candidates=(SourceWindowCandidate("candidate-a", "edit-a", "/tmp/a.mp4", "clip-a", str(source_a), 3, 27),),
+            )
+            request_b = SourceWindowMatchRequest(
+                reference_path="/tmp/reference-b.mp4",
+                model_manifest_path=str(model_manifest),
+                reference_feature_manifest_path=str(reference_b),
+                candidates=(SourceWindowCandidate("candidate-b", "edit-b", "/tmp/b.mp4", "clip-b", str(source_b), 40, 64),),
+            )
+
+            single_a = match_source_windows(request_a)
+            single_b = match_source_windows(request_b)
+            batch = match_source_windows_batch([request_a, request_b], assignment_top_n=1)
+
+            self.assertEqual(batch["request_count"], 2)
+            self.assertEqual([entry["request_index"] for entry in batch["results"]], [0, 1])
+            self.assertEqual(batch["results"][0]["result"]["matches"], single_a["matches"])
+            self.assertEqual(batch["results"][1]["result"]["matches"], single_b["matches"])
+            self.assertEqual(batch["results"][0]["result"]["ranking"]["top_candidates"][0]["candidate_id"], single_a["ranking"]["top_candidates"][0]["candidate_id"])
+            self.assertEqual(batch["results"][1]["result"]["ranking"]["top_candidates"][0]["candidate_id"], single_b["ranking"]["top_candidates"][0]["candidate_id"])
+            self.assertEqual(len(batch["sequence_assignment"]["selectedPairs"]), 2)
+
+    def test_source_window_batch_reports_cache_hits_and_isolates_feature_documents(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-batch-cache-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            requests = [
+                SourceWindowMatchRequest(
+                    reference_path=f"/tmp/reference-{index}.mp4",
+                    model_manifest_path=str(model_manifest),
+                    reference_feature_manifest_path=str(reference),
+                    candidates=(SourceWindowCandidate(f"candidate-{index}", f"edit-{index}", "/tmp/a.mp4", "clip-a", str(source), 3, 27),),
+                )
+                for index in range(2)
+            ]
+
+            batch = match_source_windows_batch(requests)
+            cached_reference = json.loads(reference.read_text(encoding="utf-8"))
+            cached_source = json.loads(source.read_text(encoding="utf-8"))
+
+            self.assertEqual(batch["cache"]["stats"]["model_manifest_hits"], 1)
+            self.assertGreaterEqual(batch["cache"]["stats"]["feature_manifest_hits"], 2)
+            self.assertEqual(batch["cache"]["cached_feature_manifest_count"], 2)
+            self.assertNotIn("_aetherflow_feature_cache", cached_reference)
+            self.assertNotIn("_aetherflow_feature_cache", cached_source)
+
+    def test_source_window_batch_handles_empty_batches(self) -> None:
+        batch = match_source_windows_batch([], assignment_top_n=3)
+
+        self.assertEqual(batch["request_count"], 0)
+        self.assertEqual(batch["results"], [])
+        self.assertEqual(batch["sequence_assignment"]["selectedPairs"], [])
+        self.assertEqual(batch["cache"]["cached_feature_manifest_count"], 0)
+
+    def test_cli_runs_source_window_batch_from_repeated_request_args(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="aetherflow-inference-source-window-batch-cli-repeat-") as temp_dir:
+            root = Path(temp_dir)
+            model_manifest = write_model_manifest(root)
+            reference_features = write_feature_manifest(root / "reference.features.json", "reference", [100.0, 120.0, 140.0])
+            source_features = write_feature_manifest(root / "source.features.json", "clip-a", [101.0, 121.0, 141.0], source_window={"source_in": 3, "source_out": 27})
+            request_a = root / "request-a.json"
+            request_b = root / "request-b.json"
+            output_path = root / "batch.json"
+            for request_path, candidate_id in ((request_a, "candidate-a"), (request_b, "candidate-b")):
+                write_source_window_request_json(request_path, model_manifest, reference_features, source_features, candidate_id=candidate_id)
+
+            exit_code = cli_main(
+                [
+                    "match-source-windows-batch",
+                    "--request",
+                    str(request_a),
+                    "--request",
+                    str(request_b),
+                    "--output",
+                    str(output_path),
+                    "--assignment-top-n",
+                    "1",
+                ]
+            )
+            result = json.loads(output_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(result["request_count"], 2)
+            self.assertEqual([Path(row["request_path"]).name for row in result["results"]], ["request-a.json", "request-b.json"])
+            self.assertEqual(len(result["sequence_assignment"]["selectedPairs"]), 2)
 
     def test_cli_validates_source_window_request_schema(self) -> None:
         schema_path = CONTRACTS_ROOT / "schemas" / "source_window_match_request.schema.json"
@@ -1611,6 +1713,37 @@ def feature_doc_from_colors(colors: list[list[float]]) -> dict:
 
 def write_json(path: Path, document: dict) -> None:
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_source_window_request_json(
+    path: Path,
+    model_manifest: Path,
+    reference_features: Path,
+    source_features: Path,
+    *,
+    candidate_id: str = "candidate-a",
+) -> None:
+    write_json(
+        path,
+        {
+            "schema_version": "0.1.0",
+            "reference_path": "/tmp/reference.mp4",
+            "model_manifest_path": str(model_manifest),
+            "reference_feature_manifest_path": str(reference_features),
+            "transforms": [],
+            "candidates": [
+                {
+                    "candidate_id": candidate_id,
+                    "candidate_group_id": candidate_id.replace("candidate", "edit"),
+                    "source_path": "/tmp/a.mp4",
+                    "source_clip_id": "clip-a",
+                    "feature_manifest_path": str(source_features),
+                    "source_in": 3,
+                    "source_out": 27,
+                }
+            ],
+        },
+    )
 
 
 def load_full_eval_script():
