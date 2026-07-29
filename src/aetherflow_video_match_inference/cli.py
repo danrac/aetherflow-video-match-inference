@@ -318,7 +318,7 @@ def load_source_window_match_request(path: str | Path, schema_path: str | Path |
 
 
 def precompute_visual_cache_for_requests(explicit_paths: list[str], request_dir: str | None, schema_path: str | Path | None, *, limit: int) -> dict:
-    from .engine import reference_window_duration
+    from .engine import reference_window_duration, visual_embedding_cache_context
     from .media_window import read_video_frame, source_crop_images
     from .visual_encoder import VisualEncoderScorer
 
@@ -347,7 +347,15 @@ def precompute_visual_cache_for_requests(explicit_paths: list[str], request_dir:
         reference_frame = read_video_frame(request.reference_path, reference_start + max(0, reference_duration // 2), fps)
         request_encoded = 0
         if reference_frame is not None:
-            scorer.encode(reference_frame.convert("RGB"))
+            reference_frame_index = reference_start + max(0, reference_duration // 2)
+            scorer.encode(
+                reference_frame.convert("RGB"),
+                cache_context=visual_embedding_cache_context(
+                    request.reference_path,
+                    reference_frame_index,
+                    fps,
+                ),
+            )
             encoded += 1
             request_encoded += 1
         for candidate in request.candidates[: max(1, int(limit))]:
@@ -357,8 +365,16 @@ def precompute_visual_cache_for_requests(explicit_paths: list[str], request_dir:
             source_frame = read_video_frame(candidate.source_path, source_frame_index, fps)
             if source_frame is None:
                 continue
-            for crop in source_crop_images(source_frame):
-                scorer.encode(crop)
+            for crop_index, crop in enumerate(source_crop_images(source_frame)):
+                scorer.encode(
+                    crop,
+                    cache_context=visual_embedding_cache_context(
+                        candidate.source_path,
+                        source_frame_index,
+                        fps,
+                        crop_index=crop_index,
+                    ),
+                )
                 encoded += 1
                 request_encoded += 1
         rows.append({"request_path": str(request_path), "status": "ok", "encoded_or_cached": request_encoded})

@@ -239,3 +239,25 @@ PYTHONPATH=src python3 -m aetherflow_video_match_inference.cli export-ae-extends
   --host-payload /path/to/host_payload.json \
   --output /path/to/aetherflow_import.jsx
 ```
+
+## Visual embedding cache
+
+Visual-encoder embeddings use the versioned
+`aetherflow.video-match-embedding-cache-entry@1.0.0` contract. Reuse is
+allowed only when the complete cache identity matches:
+
+- media locator, size, and modification time;
+- selected frame, frame rate, and crop;
+- decoded RGB pixel digest;
+- preprocessing contract and parameters;
+- model artifact identity, version metadata, and content digest;
+- requested and effective runtime providers plus ONNX Runtime version; and
+- inference input, output, dtype, and normalization configuration.
+
+Cache documents contain hashed media identity and embedding values, never
+media paths or raw image content. A changed identity creates a miss and a new
+entry; existing entries are not reused or mutated. Cache entries persist until
+the configured cache root is removed. The package does not evict entries.
+
+Only feature embeddings are cached. Candidate lists, similarity scores,
+confidence, rankings, and timeline results are always recomputed.
