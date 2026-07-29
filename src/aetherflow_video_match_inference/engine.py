@@ -332,7 +332,18 @@ def rescore_ranked_source_windows_with_visual_encoder(request: SourceWindowMatch
             reference_frame = read_video_frame(request.reference_path, reference_start + rel_frame, reference_fps)
             if reference_frame is None:
                 return [ranked_candidate_with_visual_encoder_skip(item, "reference_frame_unavailable") for item in ranked]
-            reference_embeddings.append((rel_frame, scorer.encode(reference_frame.convert("RGB"))))
+            reference_frame_index = reference_start + rel_frame
+            reference_embeddings.append((
+                rel_frame,
+                scorer.encode(
+                    reference_frame.convert("RGB"),
+                    cache_context=visual_embedding_cache_context(
+                        request.reference_path,
+                        reference_frame_index,
+                        reference_fps,
+                    ),
+                ),
+            ))
     except Exception:
         return [ranked_candidate_with_visual_encoder_skip(item, "reference_embedding_failed") for item in ranked]
 
@@ -439,7 +450,19 @@ def best_visual_source_window(request: SourceWindowMatchRequest, item: dict, ref
                     if source_frame is None:
                         sample_distances = []
                         break
-                    sample_distances.append(min(scorer.cosine_distance(reference_embedding, crop) for crop in source_crop_images(source_frame)))
+                    sample_distances.append(min(
+                        scorer.cosine_distance(
+                            reference_embedding,
+                            crop,
+                            cache_context=visual_embedding_cache_context(
+                                str(source_path),
+                                source_frame_index,
+                                reference_fps,
+                                crop_index=crop_index,
+                            ),
+                        )
+                        for crop_index, crop in enumerate(source_crop_images(source_frame))
+                    ))
                 if not sample_distances:
                     continue
                 distance = sum(sample_distances) / len(sample_distances)
@@ -466,6 +489,25 @@ def best_visual_source_window(request: SourceWindowMatchRequest, item: dict, ref
                 boundary["boundary_snap"] = True
                 best = boundary
     return best
+
+
+def visual_embedding_cache_context(
+    media_path: str,
+    frame_index: int,
+    frame_rate: float,
+    *,
+    crop_index: int | None = None,
+) -> dict:
+    frame_selection = {
+        "frameIndex": int(frame_index),
+        "frameRate": round(float(frame_rate), 9),
+    }
+    if crop_index is not None:
+        frame_selection["cropIndex"] = int(crop_index)
+    return {
+        "media": {"path": str(media_path)},
+        "frameSelection": frame_selection,
+    }
 
 
 def visual_boundary_starts(source_in: int, source_out: int, reference_duration: int) -> list[int]:
