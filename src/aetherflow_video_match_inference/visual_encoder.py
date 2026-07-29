@@ -346,6 +346,10 @@ def embedding_cache_path(
     cache_context: dict[str, Any] | None = None,
 ) -> Path:
     identity = embedding_cache_identity(onnx_path, image, cache_context)
+    return embedding_cache_path_from_identity(identity)
+
+
+def embedding_cache_path_from_identity(identity: dict[str, Any]) -> Path:
     digest = str(identity["identityDigest"])
     return visual_encoder_cache_root() / "v1" / digest[:2] / f"{digest}.json"
 
@@ -371,7 +375,7 @@ def lookup_cached_embedding(
     started = perf_counter()
     identity = embedding_cache_identity(onnx_path, image, cache_context)
     identity_digest = str(identity["identityDigest"])
-    path = embedding_cache_path(onnx_path, image, cache_context)
+    path = embedding_cache_path_from_identity(identity)
     reason = cache_miss_reason(identity)
     if not path.exists():
         return EmbeddingCacheLookup(None, "miss", reason, identity_digest, (perf_counter() - started) * 1000.0)
@@ -410,7 +414,7 @@ def store_cached_embedding(
     cache_context: dict[str, Any] | None = None,
 ) -> None:
     identity = embedding_cache_identity(onnx_path, image, cache_context)
-    path = embedding_cache_path(onnx_path, image, cache_context)
+    path = embedding_cache_path_from_identity(identity)
     subject_path = embedding_cache_subject_path(identity)
     try:
         atomic_json_write(path, {
